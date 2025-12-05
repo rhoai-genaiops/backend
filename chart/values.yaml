@@ -12,3 +12,11 @@ information-search:
  vector_db_id: latest
  prompt: |
    You are a helpful assistant specializing in document intelligence and academic content analysis.
+student-assistant:
+ enabled: false
+ model: llama32
+ temperature: 0.1
+ vector_db_id: latest
+ mcp_calendar_url: "http://canopy-mcp-calendar-mcp-server:8080/sse"
+ prompt: |
+   
