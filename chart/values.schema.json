@@ -109,6 +109,67 @@
       },
       "required": ["enabled", "model", "prompt"],
       "additionalProperties": false
+    },
+    "student-assistant": {
+      "type": "object",
+      "description": "Configuration for information search functionality",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable or disable information search functionality",
+          "default": false
+        },
+        "model": {
+          "type": "string",
+          "description": "Model identifier to use for information search",
+          "minLength": 1,
+          "examples": [
+            "llama32",
+            "llama3.2",
+            "gpt-4"
+          ]
+        },
+        "prompt": {
+          "type": "string",
+          "description": "System prompt for information search requests",
+          "minLength": 1
+        },
+        "vector_db_id": {
+          "type": "string",
+          "description": "Vector database identifier to use for information search",
+          "minLength": 1,
+          "examples": [
+            "latest",
+            "v1.0",
+            "production"
+          ]
+        },
+        "max_tokens": {
+          "type": "number",
+          "description": "Max tokens for the model"
+        },
+        "temperature": {
+          "type": "number",
+          "description": "Temperature for the model"
+        },
+        "chart_path": {
+          "type": "string",
+          "description": "Target namespace for deployment (format: userX-environment)",
+          "examples": []
+        },
+        "repo_url": {
+          "type": "string",
+          "description": "Repository URL for the Helm chart",
+          "examples": []
+        },
+        "target_revision": {
+          "type": "string",
+          "description": "Target Revision for the Helm chart",
+          "examples": []
+        }
+      },
+      "required": ["enabled", "model", "prompt"],
+      "additionalProperties": false
     }
   },
   "required": ["LLAMA_STACK_URL"],
