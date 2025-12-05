@@ -148,6 +148,10 @@
           "type": "number",
           "description": "Max tokens for the model"
         },
+        "mcp_calendar_url": {
+          "type": "string",
+          "description": "Url for the MCP calendar"
+        },
         "temperature": {
           "type": "number",
           "description": "Temperature for the model"
