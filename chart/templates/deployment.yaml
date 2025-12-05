@@ -16,6 +16,7 @@ spec:
         app: canopy-backend
       annotations:
         configmap: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        instrumentation.opentelemetry.io/inject-python: redhat-ods-monitoring/data-science-instrumentation
     spec:
       containers:
         - name: canopy-backend
@@ -25,6 +26,10 @@ spec:
           env:
             - name: LLAMA_BASE_URL
               value: "{{ .Values.LLAMA_STACK_URL }}"
+            - name: OTEL_TRACES_SAMPLER_ARG
+              value: "1.0"
+            - name: OTEL_LOGS_EXPORTER
+              value: "none"
           volumeMounts:
             - mountPath: /canopy
               name: canopy-config
