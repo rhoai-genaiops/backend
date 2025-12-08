@@ -14,6 +14,7 @@ spec:
     metadata:
       labels:
         app: canopy-backend
+        monitoring.opendatahub.io/scrape: 'true'
       annotations:
         configmap: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
         instrumentation.opentelemetry.io/inject-python: redhat-ods-monitoring/data-science-instrumentation
