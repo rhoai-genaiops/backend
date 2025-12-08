@@ -172,7 +172,7 @@
           "examples": []
         }
       },
-      "required": ["enabled", "model", "prompt"],
+      "required": ["enabled", "model"],
       "additionalProperties": false
     }
   },
