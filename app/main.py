@@ -28,7 +28,17 @@ FEATURE_FLAGS = {
     "information-search": "information-search" in config and config["information-search"]["enabled"] == True,
     "summarize": "summarize" in config and config["summarize"]["enabled"] == True,
     "student-assistant": "student-assistant" in config and config["student-assistant"]["enabled"] == True,
+    "shields": "shields" in config and config["shields"]["enabled"] == True,
 }
+
+# Shields configuration
+SHIELDS_CONFIG = {}
+if FEATURE_FLAGS.get("shields", False):
+    SHIELDS_CONFIG = {
+        "input_shields": config["shields"].get("input_shields", []),
+        "output_shields": config["shields"].get("output_shields", []),
+        "model": config["shields"].get("model", config.get("student-assistant", {}).get("model", "llama32")),
+    }
 
 # Professor directory
 PROFESSORS = {
@@ -343,6 +353,97 @@ async def student_assistant_chat(request: PromptRequest):
                                 chunk = f"data: {json.dumps({'delta': char})}\n\n"
                                 q.put(chunk)
                         break
+        except Exception as e:
+            q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
+        finally:
+            q.put(None)
+
+    threading.Thread(target=worker).start()
+
+    async def streamer():
+        while True:
+            chunk = await asyncio.get_event_loop().run_in_executor(None, q.get)
+            if chunk is None:
+                break
+            yield chunk
+
+    return StreamingResponse(streamer(), media_type="text/event-stream")
+
+@app.post("/chat-with-shields")
+async def chat_with_shields(request: PromptRequest):
+    """
+    Chat endpoint that uses Llama Stack shields for content moderation.
+    Uses the alpha agents API to support input_shields and output_shields.
+    """
+    if not FEATURE_FLAGS.get("shields", False):
+        raise HTTPException(status_code=404, detail="Shields feature is not enabled")
+
+    q = queue.Queue()
+
+    def worker():
+        try:
+            # Get shields configuration
+            input_shields = SHIELDS_CONFIG.get("input_shields", [])
+            output_shields = SHIELDS_CONFIG.get("output_shields", [])
+            model = SHIELDS_CONFIG.get("model", "llama32")
+
+            # Create agent config with shields using alpha API (llama-stack-client 0.3.0)
+            agent_config = {
+                "model": model,
+                "instructions": config["shields"].get("prompt", "You are a helpful assistant."),
+                "sampling_params": {
+                    "max_tokens": config["shields"].get("max_tokens", 512),
+                    "temperature": config["shields"].get("temperature", 0.7),
+                },
+                "input_shields": input_shields,
+                "output_shields": output_shields,
+                "max_infer_iters": 10,
+            }
+
+            # Create agent using alpha API
+            agent_response = llama_client.alpha.agents.create(agent_config=agent_config)
+            agent_id = agent_response.agent_id
+
+            # Create session
+            session_response = llama_client.alpha.agents.session.create(
+                agent_id=agent_id,
+                session_name=f"shields_session_{random.randint(1, 1000000)}"
+            )
+            session_id = session_response.session_id
+
+            # Send turn with streaming
+            response = llama_client.alpha.agents.turn.create(
+                agent_id=agent_id,
+                session_id=session_id,
+                messages=[{"role": "user", "content": request.prompt}],
+                stream=True,
+            )
+
+            # Process streaming response
+            for r in response:
+                if hasattr(r, 'event') and hasattr(r.event, 'payload'):
+                    payload = r.event.payload
+
+                    # Check for step_progress event with delta (normal streaming)
+                    if hasattr(payload, 'event_type') and payload.event_type == 'step_progress':
+                        if hasattr(payload, 'delta') and hasattr(payload.delta, 'text'):
+                            text_content = payload.delta.text
+                            if text_content:
+                                chunk = f"data: {json.dumps({'delta': text_content})}\n\n"
+                                q.put(chunk)
+
+                    # Check for shield violations (step_complete with violation)
+                    elif hasattr(payload, 'event_type') and payload.event_type == 'step_complete':
+                        if hasattr(payload, 'step_details'):
+                            step_details = payload.step_details
+                            if hasattr(step_details, 'step_type') and step_details.step_type == 'shield_call':
+                                if hasattr(step_details, 'violation') and step_details.violation is not None:
+                                    # Shield violation detected
+                                    violation_msg = getattr(step_details.violation, 'user_message', 'Content blocked by safety shields')
+                                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': violation_msg})}\n\n"
+                                    q.put(chunk)
+                                    break
+
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
