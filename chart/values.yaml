@@ -19,4 +19,4 @@ student-assistant:
  vector_db_id: latest
  mcp_calendar_url: "http://canopy-mcp-calendar-mcp-server:8080/sse"
  prompt: |
-    You are a helpful assistant specializing in student support and academic advising.
+   You are a helpful assistant.
