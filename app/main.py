@@ -17,7 +17,8 @@ import random
 
 app = FastAPI(title="Canopy Backend API")
 
-config_path = "/canopy/canopy-config.yaml"
+# config_path = "/canopy/canopy-config.yaml"
+config_path = "C:/Users/lundb/Documents/RedHat_Job/genai500/canopy-be/chart/values-tmp.yaml"
 with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
@@ -57,6 +58,7 @@ PROFESSORS = {
 # Initialize student assistant agent if enabled
 agent = None
 if FEATURE_FLAGS.get("student-assistant", False):
+    from datetime import datetime
     vector_store_id = config["student-assistant"].get("vector_db_id", "latest")
 
     @tool
@@ -117,10 +119,14 @@ if FEATURE_FLAGS.get("student-assistant", False):
         temperature=config["student-assistant"].get("temperature", 0.1)
     )
 
+    # Evaluate the prompt as an f-string to execute any Python expressions in {}
+    prompt_template = config["student-assistant"].get("prompt", "You are a helpful university assistant.")
+    formatted_prompt = eval(f'f"""{prompt_template}"""')
+
     agent = create_react_agent(
         llm,
         tools,
-        prompt=config["student-assistant"].get("prompt", "You are a helpful university assistant."),
+        prompt=formatted_prompt,
         checkpointer=MemorySaver()
     )
 
