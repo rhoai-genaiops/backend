@@ -89,7 +89,8 @@ def create_student_tools(llama_stack_client: LlamaStackClient, vector_store_id: 
                 vector_store_id=vector_store_id,
                 query=query,
                 max_num_results=3,
-                search_mode="vector"
+                search_mode="vector",
+                ranking_options={"score_threshold": 0.0}
             )
             if not results.data:
                 return "No relevant information found in the knowledge base."
