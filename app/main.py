@@ -17,7 +17,7 @@ import random
 
 app = FastAPI(title="Canopy Backend API")
 
-config_path = "/canopy/canopy-config.yaml"
+config_path = "./canopy-config.yaml"
 with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
@@ -373,12 +373,49 @@ async def student_assistant_chat(request: PromptRequest):
 async def chat_with_shields(request: PromptRequest):
     """
     Chat endpoint that uses Llama Stack shields for content moderation.
-    Uses the alpha agents API to support input_shields and output_shields.
+    Uses chunked shield checking to stop streaming immediately on violations.
     """
     if not FEATURE_FLAGS.get("shields", False):
         raise HTTPException(status_code=404, detail="Shields feature is not enabled")
 
     q = queue.Queue()
+
+    def check_shields(shield_ids: list, messages: list, is_output: bool = False) -> dict | None:
+        """Run shields and return violation info if detected, None otherwise."""
+        # Format messages properly for Llama Stack API
+        formatted_messages = []
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                # Assistant messages require stop_reason
+                formatted_messages.append({
+                    "role": "assistant",
+                    "content": msg.get("content", ""),
+                    "stop_reason": "end_of_message",
+                })
+            else:
+                formatted_messages.append(msg)
+
+        for shield_id in shield_ids:
+            try:
+                result = llama_client.safety.run_shield(
+                    shield_id=shield_id,
+                    messages=formatted_messages,
+                    params={},
+                )
+                if result.violation is not None:
+                    # Check violation level - only error/warn are actual violations
+                    # info level means content was verified successfully
+                    level = getattr(result.violation, 'violation_level', None)
+                    # Handle both string and enum values
+                    level_str = str(level).lower() if level else ""
+                    if "error" in level_str or "warn" in level_str:
+                        return {
+                            "shield_id": shield_id,
+                            "message": getattr(result.violation, 'user_message', 'Content blocked by safety shields'),
+                        }
+            except Exception as e:
+                print(f"Shield check error for {shield_id}: {e}")
+        return None
 
     def worker():
         try:
@@ -386,63 +423,66 @@ async def chat_with_shields(request: PromptRequest):
             input_shields = SHIELDS_CONFIG.get("input_shields", [])
             output_shields = SHIELDS_CONFIG.get("output_shields", [])
             model = SHIELDS_CONFIG.get("model", "llama32")
+            check_interval = config["shields"].get("check_interval", 50)  # Check every N characters
 
-            # Create agent config with shields using alpha API (llama-stack-client 0.3.0)
-            agent_config = {
-                "model": model,
-                "instructions": config["shields"].get("prompt", "You are a helpful assistant."),
-                "sampling_params": {
-                    "max_tokens": config["shields"].get("max_tokens", 512),
-                    "temperature": config["shields"].get("temperature", 0.7),
-                },
-                "input_shields": input_shields,
-                "output_shields": output_shields,
-                "max_infer_iters": 10,
-            }
+            # Step 1: Check input shields BEFORE calling LLM
+            if input_shields:
+                violation = check_shields(
+                    input_shields,
+                    [{"role": "user", "content": request.prompt}]
+                )
+                if violation:
+                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': violation['message']})}\n\n"
+                    q.put(chunk)
+                    return
 
-            # Create agent using alpha API
-            agent_response = llama_client.alpha.agents.create(agent_config=agent_config)
-            agent_id = agent_response.agent_id
-
-            # Create session
-            session_response = llama_client.alpha.agents.session.create(
-                agent_id=agent_id,
-                session_name=f"shields_session_{random.randint(1, 1000000)}"
-            )
-            session_id = session_response.session_id
-
-            # Send turn with streaming
-            response = llama_client.alpha.agents.turn.create(
-                agent_id=agent_id,
-                session_id=session_id,
-                messages=[{"role": "user", "content": request.prompt}],
+            # Step 2: Stream from inference API
+            response = llama_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": config["shields"].get("prompt", "You are a helpful assistant.")},
+                    {"role": "user", "content": request.prompt}
+                ],
+                max_tokens=config["shields"].get("max_tokens", 512),
+                temperature=config["shields"].get("temperature", 0.7),
                 stream=True,
             )
 
-            # Process streaming response
-            for r in response:
-                if hasattr(r, 'event') and hasattr(r.event, 'payload'):
-                    payload = r.event.payload
+            # Step 3: Stream tokens with periodic shield checking
+            buffer = ""
+            last_check_length = 0
 
-                    # Check for step_progress event with delta (normal streaming)
-                    if hasattr(payload, 'event_type') and payload.event_type == 'step_progress':
-                        if hasattr(payload, 'delta') and hasattr(payload.delta, 'text'):
-                            text_content = payload.delta.text
-                            if text_content:
-                                chunk = f"data: {json.dumps({'delta': text_content})}\n\n"
-                                q.put(chunk)
+            for chunk_response in response:
+                if hasattr(chunk_response, 'choices') and chunk_response.choices:
+                    choice = chunk_response.choices[0]
+                    if hasattr(choice, 'delta') and hasattr(choice.delta, 'content'):
+                        text_content = choice.delta.content
+                        if text_content:
+                            buffer += text_content
+                            chunk = f"data: {json.dumps({'delta': text_content})}\n\n"
+                            q.put(chunk)
 
-                    # Check for shield violations (step_complete with violation)
-                    elif hasattr(payload, 'event_type') and payload.event_type == 'step_complete':
-                        if hasattr(payload, 'step_details'):
-                            step_details = payload.step_details
-                            if hasattr(step_details, 'step_type') and step_details.step_type == 'shield_call':
-                                if hasattr(step_details, 'violation') and step_details.violation is not None:
-                                    # Shield violation detected
-                                    violation_msg = getattr(step_details.violation, 'user_message', 'Content blocked by safety shields')
-                                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': violation_msg})}\n\n"
+                            # Check output shields periodically
+                            if output_shields and (len(buffer) - last_check_length) >= check_interval:
+                                violation = check_shields(
+                                    output_shields,
+                                    [{"role": "assistant", "content": buffer}]
+                                )
+                                if violation:
+                                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': violation['message']})}\n\n"
                                     q.put(chunk)
-                                    break
+                                    return
+                                last_check_length = len(buffer)
+
+            # Final shield check on complete response
+            if output_shields and buffer:
+                violation = check_shields(
+                    output_shields,
+                    [{"role": "assistant", "content": buffer}]
+                )
+                if violation:
+                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': violation['message']})}\n\n"
+                    q.put(chunk)
 
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
