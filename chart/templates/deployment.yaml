@@ -21,7 +21,7 @@ spec:
     spec:
       containers:
         - name: canopy-backend
-          image: quay.io/rhoai-genaiops/canopy-be:0.10
+          image: quay.io/rhoai-genaiops/canopy-be:0.11
           ports:
             - containerPort: 8000
           env:
@@ -31,6 +31,14 @@ spec:
               value: "1.0"
             - name: OTEL_LOGS_EXPORTER
               value: "none"
+            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              value: "http://data-science-collector-collector-headless.redhat-ods-monitoring.svc.cluster.local:4318/v1/traces"
+            - name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+              value: "http://data-science-collector-collector-headless.redhat-ods-monitoring.svc.cluster.local:4318/v1/metrics"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://data-science-collector-collector-headless.redhat-ods-monitoring.svc.cluster.local:4318"
+            - name: TELEMETRY_SINKS
+              value: "otel_trace"
           volumeMounts:
             - mountPath: /canopy
               name: canopy-config

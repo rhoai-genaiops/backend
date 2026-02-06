@@ -17,29 +17,42 @@ import random
 
 app = FastAPI(title="Canopy Backend API")
 
+# Load configuration with fallback for testing
 config_path = os.getenv("CANOPY_CONFIG_PATH", "/canopy/canopy-config.yaml")
-with open(config_path, 'r') as f:
-    config = yaml.safe_load(f)
+if os.path.exists(config_path):
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
 
-llama_client = LlamaStackClient(base_url=config["LLAMA_STACK_URL"])
+    llama_client = LlamaStackClient(base_url=config["LLAMA_STACK_URL"])
 
-# Feature flags configuration from environment variables
-FEATURE_FLAGS = {
-    "information-search": "information-search" in config and config["information-search"]["enabled"] == True,
-    "summarize": "summarize" in config and config["summarize"]["enabled"] == True,
-    "student-assistant": "student-assistant" in config and config["student-assistant"]["enabled"] == True,
-    "shields": "shields" in config and config["shields"]["enabled"] == True,
-}
-
-# Shields configuration
-SHIELDS_CONFIG = {}
-if FEATURE_FLAGS.get("shields", False):
-    SHIELDS_CONFIG = {
-        "input_shields": config["shields"].get("input_shields", []),
-        "output_shields": config["shields"].get("output_shields", []),
-        "model": config["shields"].get("model", config.get("student-assistant", {}).get("model", "llama32")),
-        "check_interval": config["shields"].get("check_interval", 50),
+    # Feature flags configuration from environment variables
+    FEATURE_FLAGS = {
+        "information-search": "information-search" in config and config["information-search"]["enabled"] == True,
+        "summarize": "summarize" in config and config["summarize"]["enabled"] == True,
+        "student-assistant": "student-assistant" in config and config["student-assistant"]["enabled"] == True,
+        "shields": "shields" in config and config["shields"]["enabled"] == True,
     }
+
+    # Shields configuration
+    SHIELDS_CONFIG = {}
+    if FEATURE_FLAGS.get("shields", False):
+        SHIELDS_CONFIG = {
+            "input_shields": config["shields"].get("input_shields", []),
+            "output_shields": config["shields"].get("output_shields", []),
+            "model": config["shields"].get("model", config.get("student-assistant", {}).get("model", "llama32")),
+            "check_interval": config["shields"].get("check_interval", 50),
+        }
+else:
+    # Fallback for testing - config will be loaded by tests
+    config = None
+    llama_client = None
+    FEATURE_FLAGS = {
+        "information-search": False,
+        "summarize": False,
+        "student-assistant": False,
+        "shields": False,
+    }
+    SHIELDS_CONFIG = {}
 
 def check_shields(shield_ids: list, messages: list) -> dict | None:
     """Run shields and return violation info if detected, None otherwise."""
@@ -80,44 +93,56 @@ def check_shields(shield_ids: list, messages: list) -> dict | None:
             print(f"Shield check error for {shield_id}: {e}")
     return None
 
-# Professor directory
-PROFESSORS = {
-    "Dr. Sarah Chen": {
-        "department": "Computer Science",
-        "expertise": ["Machine Learning", "Neural Networks", "AI Ethics", "Agentic Workflows"],
-        "email": "s.chen@university.edu"
-    },
-    "Prof. Michael Rodriguez": {
-        "department": "Physics",
-        "expertise": ["Quantum Mechanics", "Particle Physics", "Quantum Chromodynamics"],
-        "email": "m.rodriguez@university.edu"
-    },
-    "Dr. Emily Thompson": {
-        "department": "Biology",
-        "expertise": ["Botany", "Ecology", "Forest Canopy Structure", "Plant Biology"],
-        "email": "e.thompson@university.edu"
-    },
-    "Prof. James Wilson": {
-        "department": "Computer Science",
-        "expertise": ["Distributed Systems", "Cloud Computing", "Software Architecture"],
-        "email": "j.wilson@university.edu"
-    }
-}
+# Tool factory function for creating student assistant tools
+# This allows tools to be imported and tested independently
+def create_student_tools(llama_stack_client: LlamaStackClient, vector_store_id: str):
+    """
+    Factory function to create student assistant tools.
 
-# Initialize student assistant agent if enabled
-agent = None
-if FEATURE_FLAGS.get("student-assistant", False):
-    vector_store_id = config["student-assistant"].get("vector_db_id", "latest")
+    This function is used both by the agent in production and by tests.
+    It ensures a single source of truth for tool implementations.
+
+    Args:
+        llama_stack_client: LlamaStackClient instance for vector search
+        vector_store_id: ID of the vector store to search
+
+    Returns:
+        List of LangChain tools (search_knowledge_base, find_professors_by_expertise)
+    """
+    # Professor directory - used by find_professors_by_expertise tool
+    PROFESSORS = {
+        "Dr. Sarah Chen": {
+            "department": "Computer Science",
+            "expertise": ["Machine Learning", "Neural Networks", "AI Ethics", "Agentic Workflows"],
+            "email": "s.chen@university.edu"
+        },
+        "Prof. Michael Rodriguez": {
+            "department": "Physics",
+            "expertise": ["Quantum Mechanics", "Particle Physics", "Quantum Chromodynamics"],
+            "email": "m.rodriguez@university.edu"
+        },
+        "Dr. Emily Thompson": {
+            "department": "Biology",
+            "expertise": ["Botany", "Ecology", "Forest Canopy Structure", "Plant Biology"],
+            "email": "e.thompson@university.edu"
+        },
+        "Prof. James Wilson": {
+            "department": "Computer Science",
+            "expertise": ["Distributed Systems", "Cloud Computing", "Software Architecture"],
+            "email": "j.wilson@university.edu"
+        }
+    }
 
     @tool
     def search_knowledge_base(query: str) -> str:
         """Search through documents to find information. Use this when the user asks about concepts, definitions, or topics."""
         try:
-            results = llama_client.vector_stores.search(
+            results = llama_stack_client.vector_stores.search(
                 vector_store_id=vector_store_id,
                 query=query,
                 max_num_results=3,
-                search_mode="vector"
+                search_mode="vector",
+                ranking_options={"score_threshold": 0.0}
             )
             if not results.data:
                 return "No relevant information found in the knowledge base."
@@ -148,9 +173,19 @@ if FEATURE_FLAGS.get("student-assistant", False):
             result += f"**{name}** - {info['department']}\n  Expertise: {', '.join(info['expertise'])}\n  Email: {info['email']}\n\n"
         return result
 
-    tools = [
-        search_knowledge_base,
-        find_professors_by_expertise,
+    return [search_knowledge_base, find_professors_by_expertise]
+
+
+# Initialize student assistant agent if enabled
+agent = None
+if FEATURE_FLAGS.get("student-assistant", False):
+    from datetime import datetime
+    vector_store_id = config["student-assistant"].get("vector_db_id", "latest")
+
+    # Create tools using factory function
+    student_tools = create_student_tools(llama_client, vector_store_id)
+
+    tools = student_tools + [
         {
             "type": "mcp",
             "server_label": "canopy-calendar",
@@ -167,10 +202,14 @@ if FEATURE_FLAGS.get("student-assistant", False):
         temperature=config["student-assistant"].get("temperature", 0.1)
     )
 
+    # Evaluate the prompt as an f-string to execute any Python expressions in {}
+    prompt_template = config["student-assistant"].get("prompt", "You are a helpful university assistant.")
+    formatted_prompt = eval(f'f"""{prompt_template}"""')
+
     agent = create_react_agent(
         llm,
         tools,
-        prompt=config["student-assistant"].get("prompt", "You are a helpful university assistant."),
+        prompt=formatted_prompt,
         checkpointer=MemorySaver()
     )
 
