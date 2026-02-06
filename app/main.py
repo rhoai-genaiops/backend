@@ -17,7 +17,7 @@ import random
 
 app = FastAPI(title="Canopy Backend API")
 
-config_path = "./canopy-config.yaml"
+config_path = os.getenv("CANOPY_CONFIG_PATH", "/canopy/canopy-config.yaml")
 with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
@@ -38,7 +38,47 @@ if FEATURE_FLAGS.get("shields", False):
         "input_shields": config["shields"].get("input_shields", []),
         "output_shields": config["shields"].get("output_shields", []),
         "model": config["shields"].get("model", config.get("student-assistant", {}).get("model", "llama32")),
+        "check_interval": config["shields"].get("check_interval", 50),
     }
+
+def check_shields(shield_ids: list, messages: list) -> dict | None:
+    """Run shields and return violation info if detected, None otherwise."""
+    if not shield_ids or not FEATURE_FLAGS.get("shields", False):
+        return None
+
+    # Format messages properly for Llama Stack API
+    formatted_messages = []
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            # Assistant messages require stop_reason
+            formatted_messages.append({
+                "role": "assistant",
+                "content": msg.get("content", ""),
+                "stop_reason": "end_of_message",
+            })
+        else:
+            formatted_messages.append(msg)
+
+    for shield_id in shield_ids:
+        try:
+            result = llama_client.safety.run_shield(
+                shield_id=shield_id,
+                messages=formatted_messages,
+                params={},
+            )
+            if result.violation is not None:
+                # Check violation level - only error/warn are actual violations
+                # info level means content was verified successfully
+                level = getattr(result.violation, 'violation_level', None)
+                level_str = str(level).lower() if level else ""
+                if "error" in level_str or "warn" in level_str:
+                    return {
+                        "shield_id": shield_id,
+                        "message": getattr(result.violation, 'user_message', 'Content blocked by safety shields'),
+                    }
+        except Exception as e:
+            print(f"Shield check error for {shield_id}: {e}")
+    return None
 
 # Professor directory
 PROFESSORS = {
@@ -151,33 +191,109 @@ async def summarize(request: PromptRequest):
     sys_prompt = config["summarize"].get("prompt", "Summarize the following text:")
     temperature = config["summarize"].get("temperature", 0.7)
     max_tokens = config["summarize"].get("max_tokens", 4096)
+    model = config["summarize"]["model"]
 
     q = queue.Queue()
 
-    def worker():
-        print(f"sending requestion to model {config['summarize']['model']}")
+    def worker_with_shields():
+        """Use Agent API when shields are enabled - shields handled server-side."""
+        print(f"sending request to model {model} with shields (Agent API)")
         try:
-            response = llama_client.chat.completions.create(
-                model=config["summarize"]["model"],
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": request.prompt},
-                ],
-                max_tokens=max_tokens, 
-                temperature=temperature,
+            input_shields = SHIELDS_CONFIG.get("input_shields", [])
+            output_shields = SHIELDS_CONFIG.get("output_shields", [])
+
+            # Create agent config with shields
+            agent_config = {
+                "model": model,
+                "instructions": sys_prompt,
+                "sampling_params": {
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
+                "input_shields": input_shields,
+                "output_shields": output_shields,
+                "max_infer_iters": 10,
+            }
+
+            # Create agent
+            agent_response = llama_client.alpha.agents.create(agent_config=agent_config)
+            agent_id = agent_response.agent_id
+
+            # Create session
+            session_response = llama_client.alpha.agents.session.create(
+                agent_id=agent_id,
+                session_name=f"summarize_session_{random.randint(1, 1000000)}"
+            )
+            session_id = session_response.session_id
+
+            # Stream with shields handled by server
+            response = llama_client.alpha.agents.turn.create(
+                agent_id=agent_id,
+                session_id=session_id,
+                messages=[{"role": "user", "content": request.prompt}],
                 stream=True,
             )
+
             for r in response:
-                if hasattr(r, 'choices') and r.choices:
-                    delta = r.choices[0].delta
-                    chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
-                    q.put(chunk)
+                if hasattr(r, 'event') and hasattr(r.event, 'payload'):
+                    payload = r.event.payload
+
+                    # Handle streaming text
+                    if hasattr(payload, 'event_type') and payload.event_type == 'step_progress':
+                        if hasattr(payload, 'delta') and hasattr(payload.delta, 'text'):
+                            text_content = payload.delta.text
+                            if text_content:
+                                chunk = f"data: {json.dumps({'delta': text_content})}\n\n"
+                                q.put(chunk)
+
+                    # Handle shield violations (detected by server)
+                    elif hasattr(payload, 'event_type') and payload.event_type == 'step_complete':
+                        if hasattr(payload, 'step_details'):
+                            step_details = payload.step_details
+                            if hasattr(step_details, 'step_type') and step_details.step_type == 'shield_call':
+                                if hasattr(step_details, 'violation') and step_details.violation is not None:
+                                    violation_msg = getattr(step_details.violation, 'user_message', 'Content blocked by safety shields')
+                                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': violation_msg})}\n\n"
+                                    q.put(chunk)
+                                    break
+
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
             q.put(None)
 
-    threading.Thread(target=worker).start()
+    def worker_without_shields():
+        """Use direct inference API when shields are disabled."""
+        print(f"sending request to model {model} without shields (Inference API)")
+        try:
+            response = llama_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": request.prompt},
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+
+            for r in response:
+                if hasattr(r, 'choices') and r.choices:
+                    delta = r.choices[0].delta
+                    if delta.content:
+                        chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
+                        q.put(chunk)
+
+        except Exception as e:
+            q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
+        finally:
+            q.put(None)
+
+    # Choose worker based on shields feature flag
+    if FEATURE_FLAGS.get("shields", False):
+        threading.Thread(target=worker_with_shields).start()
+    else:
+        threading.Thread(target=worker_without_shields).start()
 
     async def streamer():
         while True:
@@ -379,43 +495,6 @@ async def chat_with_shields(request: PromptRequest):
         raise HTTPException(status_code=404, detail="Shields feature is not enabled")
 
     q = queue.Queue()
-
-    def check_shields(shield_ids: list, messages: list, is_output: bool = False) -> dict | None:
-        """Run shields and return violation info if detected, None otherwise."""
-        # Format messages properly for Llama Stack API
-        formatted_messages = []
-        for msg in messages:
-            if msg.get("role") == "assistant":
-                # Assistant messages require stop_reason
-                formatted_messages.append({
-                    "role": "assistant",
-                    "content": msg.get("content", ""),
-                    "stop_reason": "end_of_message",
-                })
-            else:
-                formatted_messages.append(msg)
-
-        for shield_id in shield_ids:
-            try:
-                result = llama_client.safety.run_shield(
-                    shield_id=shield_id,
-                    messages=formatted_messages,
-                    params={},
-                )
-                if result.violation is not None:
-                    # Check violation level - only error/warn are actual violations
-                    # info level means content was verified successfully
-                    level = getattr(result.violation, 'violation_level', None)
-                    # Handle both string and enum values
-                    level_str = str(level).lower() if level else ""
-                    if "error" in level_str or "warn" in level_str:
-                        return {
-                            "shield_id": shield_id,
-                            "message": getattr(result.violation, 'user_message', 'Content blocked by safety shields'),
-                        }
-            except Exception as e:
-                print(f"Shield check error for {shield_id}: {e}")
-        return None
 
     def worker():
         try:
