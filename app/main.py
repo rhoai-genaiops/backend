@@ -30,7 +30,18 @@ if os.path.exists(config_path):
         "information-search": "information-search" in config and config["information-search"]["enabled"] == True,
         "summarize": "summarize" in config and config["summarize"]["enabled"] == True,
         "student-assistant": "student-assistant" in config and config["student-assistant"]["enabled"] == True,
+        "shields": "shields" in config and config["shields"]["enabled"] == True,
     }
+
+    # Shields configuration
+    SHIELDS_CONFIG = {}
+    if FEATURE_FLAGS.get("shields", False):
+        SHIELDS_CONFIG = {
+            "input_shields": config["shields"].get("input_shields", []),
+            "output_shields": config["shields"].get("output_shields", []),
+            "model": config["shields"].get("model", config.get("student-assistant", {}).get("model", "llama32")),
+            "check_interval": config["shields"].get("check_interval", 50),
+        }
 else:
     # Fallback for testing - config will be loaded by tests
     config = None
@@ -39,7 +50,9 @@ else:
         "information-search": False,
         "summarize": False,
         "student-assistant": False,
+        "shields": False,
     }
+    SHIELDS_CONFIG = {}
 
 # Tool factory function for creating student assistant tools
 # This allows tools to be imported and tested independently
@@ -178,33 +191,115 @@ async def summarize(request: PromptRequest):
     sys_prompt = config["summarize"].get("prompt", "Summarize the following text:")
     temperature = config["summarize"].get("temperature", 0.7)
     max_tokens = config["summarize"].get("max_tokens", 4096)
+    model = config["summarize"]["model"]
 
     q = queue.Queue()
 
-    def worker():
-        print(f"sending requestion to model {config['summarize']['model']}")
+    def worker_with_shields():
+        """Use Responses API when shields are enabled - guardrails handled server-side."""
+        print(f"sending request to model {model} with shields (Responses API)")
         try:
-            response = llama_client.chat.completions.create(
-                model=config["summarize"]["model"],
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": request.prompt},
-                ],
-                max_tokens=max_tokens, 
+            input_shields = SHIELDS_CONFIG.get("input_shields", [])
+            output_shields = SHIELDS_CONFIG.get("output_shields", [])
+            # Combine input and output shields for guardrails
+            guardrails = list(set(input_shields + output_shields))
+
+            # Use Responses API with guardrails
+            response = llama_client.responses.create(
+                model=model,
+                instructions=sys_prompt,
+                input=[{"role": "user", "content": request.prompt, "type": "message"}],
                 temperature=temperature,
                 stream=True,
+                extra_body={"guardrails": guardrails} if guardrails else None,
             )
-            for r in response:
-                if hasattr(r, 'choices') and r.choices:
-                    delta = r.choices[0].delta
-                    chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
+
+            for event in response:
+                # Handle different event types
+                event_type = getattr(event, 'type', None)
+                print(f"[Responses API] Event type: {event_type}")
+                print(f"[Responses API] Event: {event}")
+
+                # Handle text delta streaming
+                if event_type == 'response.output_text.delta':
+                    delta_text = getattr(event, 'delta', '')
+                    if delta_text:
+                        print(f"[Responses API] Delta: {delta_text}")
+                        chunk = f"data: {json.dumps({'delta': delta_text})}\n\n"
+                        q.put(chunk)
+
+                # Handle response failure (includes guardrail violations)
+                elif event_type == 'response.failed':
+                    error_msg = 'Response generation failed'
+                    if hasattr(event, 'response') and hasattr(event.response, 'error'):
+                        error_msg = getattr(event.response.error, 'message', error_msg)
+                    print(f"[Responses API] Failed: {error_msg}")
+                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
                     q.put(chunk)
+                    break
+
+                # Handle completed response
+                elif event_type == 'response.completed':
+                    print(f"[Responses API] Completed")
+                    if hasattr(event, 'response'):
+                        resp = event.response
+                        # Check for refusal in output (guardrail violation)
+                        if hasattr(resp, 'output') and resp.output:
+                            for output_msg in resp.output:
+                                if hasattr(output_msg, 'content') and output_msg.content:
+                                    for content_item in output_msg.content:
+                                        if isinstance(content_item, dict) and content_item.get('type') == 'refusal':
+                                            error_msg = "Your request was blocked by our safety guardrails"
+                                            print(f"[Responses API] Guardrail refusal detected")
+                                            chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
+                                            q.put(chunk)
+                                            return
+                        # Check if response has error status
+                        if hasattr(resp, 'status') and resp.status == 'failed':
+                            error_msg = 'Content blocked by safety guardrails'
+                            if hasattr(resp, 'error') and resp.error:
+                                error_msg = getattr(resp.error, 'message', error_msg)
+                            print(f"[Responses API] Guardrail violation: {error_msg}")
+                            chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
+                            q.put(chunk)
+
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
             q.put(None)
 
-    threading.Thread(target=worker).start()
+    def worker_without_shields():
+        """Use direct inference API when shields are disabled."""
+        print(f"sending request to model {model} without shields (Inference API)")
+        try:
+            response = llama_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": request.prompt},
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+
+            for r in response:
+                if hasattr(r, 'choices') and r.choices:
+                    delta = r.choices[0].delta
+                    if delta.content:
+                        chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
+                        q.put(chunk)
+
+        except Exception as e:
+            q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
+        finally:
+            q.put(None)
+
+    # Choose worker based on shields feature flag
+    if FEATURE_FLAGS.get("shields", False):
+        threading.Thread(target=worker_with_shields).start()
+    else:
+        threading.Thread(target=worker_without_shields).start()
 
     async def streamer():
         while True:
