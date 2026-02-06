@@ -18,7 +18,7 @@ import random
 app = FastAPI(title="Canopy Backend API")
 
 # Load configuration with fallback for testing
-config_path = os.getenv("CANOPY_CONFIG_PATH", "/canopy/canopy-config.yaml")
+config_path = os.getenv("CANOPY_CONFIG_PATH", "./canopy-config.yaml")
 if os.path.exists(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -280,9 +280,20 @@ async def summarize(request: PromptRequest):
                 # Handle completed response
                 elif event_type == 'response.completed':
                     print(f"[Responses API] Completed")
-                    # Check if response has error status
                     if hasattr(event, 'response'):
                         resp = event.response
+                        # Check for refusal in output (guardrail violation)
+                        if hasattr(resp, 'output') and resp.output:
+                            for output_msg in resp.output:
+                                if hasattr(output_msg, 'content') and output_msg.content:
+                                    for content_item in output_msg.content:
+                                        if isinstance(content_item, dict) and content_item.get('type') == 'refusal':
+                                            error_msg = "Your request was blocked by our safety guardrails"
+                                            print(f"[Responses API] Guardrail refusal detected")
+                                            chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
+                                            q.put(chunk)
+                                            return
+                        # Check if response has error status
                         if hasattr(resp, 'status') and resp.status == 'failed':
                             error_msg = 'Content blocked by safety guardrails'
                             if hasattr(resp, 'error') and resp.error:
