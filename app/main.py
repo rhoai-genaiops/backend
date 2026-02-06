@@ -18,7 +18,7 @@ import random
 app = FastAPI(title="Canopy Backend API")
 
 # Load configuration with fallback for testing
-config_path = os.getenv("CANOPY_CONFIG_PATH", "./canopy-config.yaml")
+config_path = os.getenv("CANOPY_CONFIG_PATH", "/canopy/canopy-config.yaml")
 if os.path.exists(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -514,100 +514,6 @@ async def student_assistant_chat(request: PromptRequest):
                                 chunk = f"data: {json.dumps({'delta': char})}\n\n"
                                 q.put(chunk)
                         break
-        except Exception as e:
-            q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
-        finally:
-            q.put(None)
-
-    threading.Thread(target=worker).start()
-
-    async def streamer():
-        while True:
-            chunk = await asyncio.get_event_loop().run_in_executor(None, q.get)
-            if chunk is None:
-                break
-            yield chunk
-
-    return StreamingResponse(streamer(), media_type="text/event-stream")
-
-@app.post("/chat-with-shields")
-async def chat_with_shields(request: PromptRequest):
-    """
-    Chat endpoint that uses Llama Stack shields for content moderation.
-    Uses chunked shield checking to stop streaming immediately on violations.
-    """
-    if not FEATURE_FLAGS.get("shields", False):
-        raise HTTPException(status_code=404, detail="Shields feature is not enabled")
-
-    q = queue.Queue()
-
-    def worker():
-        try:
-            # Get shields configuration
-            input_shields = SHIELDS_CONFIG.get("input_shields", [])
-            output_shields = SHIELDS_CONFIG.get("output_shields", [])
-            model = SHIELDS_CONFIG.get("model", "llama32")
-            check_interval = config["shields"].get("check_interval", 50)  # Check every N characters
-
-            # Step 1: Check input shields BEFORE calling LLM
-            if input_shields:
-                violation = check_shields(
-                    input_shields,
-                    [{"role": "user", "content": request.prompt}]
-                )
-                if violation:
-                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': violation['message']})}\n\n"
-                    q.put(chunk)
-                    return
-
-            # Step 2: Stream from inference API
-            response = llama_client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": config["shields"].get("prompt", "You are a helpful assistant.")},
-                    {"role": "user", "content": request.prompt}
-                ],
-                max_tokens=config["shields"].get("max_tokens", 512),
-                temperature=config["shields"].get("temperature", 0.7),
-                stream=True,
-            )
-
-            # Step 3: Stream tokens with periodic shield checking
-            buffer = ""
-            last_check_length = 0
-
-            for chunk_response in response:
-                if hasattr(chunk_response, 'choices') and chunk_response.choices:
-                    choice = chunk_response.choices[0]
-                    if hasattr(choice, 'delta') and hasattr(choice.delta, 'content'):
-                        text_content = choice.delta.content
-                        if text_content:
-                            buffer += text_content
-                            chunk = f"data: {json.dumps({'delta': text_content})}\n\n"
-                            q.put(chunk)
-
-                            # Check output shields periodically
-                            if output_shields and (len(buffer) - last_check_length) >= check_interval:
-                                violation = check_shields(
-                                    output_shields,
-                                    [{"role": "assistant", "content": buffer}]
-                                )
-                                if violation:
-                                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': violation['message']})}\n\n"
-                                    q.put(chunk)
-                                    return
-                                last_check_length = len(buffer)
-
-            # Final shield check on complete response
-            if output_shields and buffer:
-                violation = check_shields(
-                    output_shields,
-                    [{"role": "assistant", "content": buffer}]
-                )
-                if violation:
-                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': violation['message']})}\n\n"
-                    q.put(chunk)
-
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
