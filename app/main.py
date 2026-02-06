@@ -235,66 +235,61 @@ async def summarize(request: PromptRequest):
     q = queue.Queue()
 
     def worker_with_shields():
-        """Use Agent API when shields are enabled - shields handled server-side."""
-        print(f"sending request to model {model} with shields (Agent API)")
+        """Use Responses API when shields are enabled - guardrails handled server-side."""
+        print(f"sending request to model {model} with shields (Responses API)")
         try:
             input_shields = SHIELDS_CONFIG.get("input_shields", [])
             output_shields = SHIELDS_CONFIG.get("output_shields", [])
+            # Combine input and output shields for guardrails
+            guardrails = list(set(input_shields + output_shields))
 
-            # Create agent config with shields
-            agent_config = {
-                "model": model,
-                "instructions": sys_prompt,
-                "sampling_params": {
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                },
-                "input_shields": input_shields,
-                "output_shields": output_shields,
-                "max_infer_iters": 10,
-            }
-
-            # Create agent
-            agent_response = llama_client.alpha.agents.create(agent_config=agent_config)
-            agent_id = agent_response.agent_id
-
-            # Create session
-            session_response = llama_client.alpha.agents.session.create(
-                agent_id=agent_id,
-                session_name=f"summarize_session_{random.randint(1, 1000000)}"
-            )
-            session_id = session_response.session_id
-
-            # Stream with shields handled by server
-            response = llama_client.alpha.agents.turn.create(
-                agent_id=agent_id,
-                session_id=session_id,
-                messages=[{"role": "user", "content": request.prompt}],
+            # Use Responses API with guardrails
+            response = llama_client.responses.create(
+                model=model,
+                instructions=sys_prompt,
+                input=[{"role": "user", "content": request.prompt, "type": "message"}],
+                temperature=temperature,
                 stream=True,
+                extra_body={"guardrails": guardrails} if guardrails else None,
             )
 
-            for r in response:
-                if hasattr(r, 'event') and hasattr(r.event, 'payload'):
-                    payload = r.event.payload
+            for event in response:
+                # Handle different event types
+                event_type = getattr(event, 'type', None)
+                print(f"[Responses API] Event type: {event_type}")
+                print(f"[Responses API] Event: {event}")
 
-                    # Handle streaming text
-                    if hasattr(payload, 'event_type') and payload.event_type == 'step_progress':
-                        if hasattr(payload, 'delta') and hasattr(payload.delta, 'text'):
-                            text_content = payload.delta.text
-                            if text_content:
-                                chunk = f"data: {json.dumps({'delta': text_content})}\n\n"
-                                q.put(chunk)
+                # Handle text delta streaming
+                if event_type == 'response.output_text.delta':
+                    delta_text = getattr(event, 'delta', '')
+                    if delta_text:
+                        print(f"[Responses API] Delta: {delta_text}")
+                        chunk = f"data: {json.dumps({'delta': delta_text})}\n\n"
+                        q.put(chunk)
 
-                    # Handle shield violations (detected by server)
-                    elif hasattr(payload, 'event_type') and payload.event_type == 'step_complete':
-                        if hasattr(payload, 'step_details'):
-                            step_details = payload.step_details
-                            if hasattr(step_details, 'step_type') and step_details.step_type == 'shield_call':
-                                if hasattr(step_details, 'violation') and step_details.violation is not None:
-                                    violation_msg = getattr(step_details.violation, 'user_message', 'Content blocked by safety shields')
-                                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': violation_msg})}\n\n"
-                                    q.put(chunk)
-                                    break
+                # Handle response failure (includes guardrail violations)
+                elif event_type == 'response.failed':
+                    error_msg = 'Response generation failed'
+                    if hasattr(event, 'response') and hasattr(event.response, 'error'):
+                        error_msg = getattr(event.response.error, 'message', error_msg)
+                    print(f"[Responses API] Failed: {error_msg}")
+                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
+                    q.put(chunk)
+                    break
+
+                # Handle completed response
+                elif event_type == 'response.completed':
+                    print(f"[Responses API] Completed")
+                    # Check if response has error status
+                    if hasattr(event, 'response'):
+                        resp = event.response
+                        if hasattr(resp, 'status') and resp.status == 'failed':
+                            error_msg = 'Content blocked by safety guardrails'
+                            if hasattr(resp, 'error') and resp.error:
+                                error_msg = getattr(resp.error, 'message', error_msg)
+                            print(f"[Responses API] Guardrail violation: {error_msg}")
+                            chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
+                            q.put(chunk)
 
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
