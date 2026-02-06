@@ -18,8 +18,7 @@ import random
 app = FastAPI(title="Canopy Backend API")
 
 # Load configuration with fallback for testing
-# config_path = os.getenv("CANOPY_CONFIG_PATH", "/canopy/canopy-config.yaml")
-config_path = os.getenv("CANOPY_CONFIG_PATH", "./canopy-config.yaml")
+config_path = os.getenv("CANOPY_CONFIG_PATH", "/canopy/canopy-config.yaml")
 if os.path.exists(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
