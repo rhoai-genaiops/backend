@@ -18,7 +18,8 @@ import random
 app = FastAPI(title="Canopy Backend API")
 
 # Load configuration with fallback for testing
-config_path = os.getenv("CANOPY_CONFIG_PATH", "/canopy/canopy-config.yaml")
+# config_path = os.getenv("CANOPY_CONFIG_PATH", "/canopy/canopy-config.yaml")
+config_path = os.getenv("CANOPY_CONFIG_PATH", "./canopy-config.yaml")
 if os.path.exists(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -53,45 +54,6 @@ else:
         "shields": False,
     }
     SHIELDS_CONFIG = {}
-
-def check_shields(shield_ids: list, messages: list) -> dict | None:
-    """Run shields and return violation info if detected, None otherwise."""
-    if not shield_ids or not FEATURE_FLAGS.get("shields", False):
-        return None
-
-    # Format messages properly for Llama Stack API
-    formatted_messages = []
-    for msg in messages:
-        if msg.get("role") == "assistant":
-            # Assistant messages require stop_reason
-            formatted_messages.append({
-                "role": "assistant",
-                "content": msg.get("content", ""),
-                "stop_reason": "end_of_message",
-            })
-        else:
-            formatted_messages.append(msg)
-
-    for shield_id in shield_ids:
-        try:
-            result = llama_client.safety.run_shield(
-                shield_id=shield_id,
-                messages=formatted_messages,
-                params={},
-            )
-            if result.violation is not None:
-                # Check violation level - only error/warn are actual violations
-                # info level means content was verified successfully
-                level = getattr(result.violation, 'violation_level', None)
-                level_str = str(level).lower() if level else ""
-                if "error" in level_str or "warn" in level_str:
-                    return {
-                        "shield_id": shield_id,
-                        "message": getattr(result.violation, 'user_message', 'Content blocked by safety shields'),
-                    }
-        except Exception as e:
-            print(f"Shield check error for {shield_id}: {e}")
-    return None
 
 # Tool factory function for creating student assistant tools
 # This allows tools to be imported and tested independently
