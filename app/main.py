@@ -1,14 +1,16 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from llama_stack_client import LlamaStackClient
 import os
 import asyncio
-from fastapi.responses import StreamingResponse
 import json
+import logging
 import threading
 import queue
 import yaml
+from datetime import datetime, timezone
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
@@ -30,7 +32,20 @@ if os.path.exists(config_path):
         "information-search": "information-search" in config and config["information-search"]["enabled"] == True,
         "summarize": "summarize" in config and config["summarize"]["enabled"] == True,
         "student-assistant": "student-assistant" in config and config["student-assistant"]["enabled"] == True,
+        "shields": "shields" in config and config["shields"]["enabled"] == True,
+        "feedback": "feedback" in config and config["feedback"]["enabled"] == True,
+        "ab_testing": "ab_testing" in config and config["ab_testing"]["enabled"] == True,
     }
+
+    # Shields configuration
+    SHIELDS_CONFIG = {}
+    if FEATURE_FLAGS.get("shields", False):
+        SHIELDS_CONFIG = {
+            "input_shields": config["shields"].get("input_shields", []),
+            "output_shields": config["shields"].get("output_shields", []),
+            "model": config["shields"].get("model", config.get("student-assistant", {}).get("model", "llama32")),
+            "check_interval": config["shields"].get("check_interval", 50),
+        }
 else:
     # Fallback for testing - config will be loaded by tests
     config = None
@@ -39,7 +54,11 @@ else:
         "information-search": False,
         "summarize": False,
         "student-assistant": False,
+        "shields": False,
+        "feedback": False,
+        "ab_testing": False,
     }
+    SHIELDS_CONFIG = {}
 
 # Tool factory function for creating student assistant tools
 # This allows tools to be imported and tested independently
@@ -161,13 +180,265 @@ if FEATURE_FLAGS.get("student-assistant", False):
         checkpointer=MemorySaver()
     )
 
+# Structured logger for feedback events (collected by LokiStack via STDOUT)
+feedback_logger = logging.getLogger("canopy.feedback")
+feedback_logger.setLevel(logging.INFO)
+feedback_logger.propagate = False  # Prevent duplicate output from root logger
+_feedback_handler = logging.StreamHandler()
+_feedback_handler.setFormatter(logging.Formatter('%(message)s'))
+feedback_logger.addHandler(_feedback_handler)
+
+# In-memory feedback store (data lost on restart - acceptable for enablement)
+feedback_store: List[Dict[str, Any]] = []
+
+# In-memory A/B feedback store (separate from regular feedback)
+ab_feedback_store: List[Dict[str, Any]] = []
+
 class PromptRequest(BaseModel):
     prompt: str
+
+class FeedbackRequest(BaseModel):
+    input_text: str
+    response_text: str
+    rating: str  # "thumbs_up" or "thumbs_down"
+    feature: str = "summarize"
+    comment: Optional[str] = None
+
+class ABFeedbackRequest(BaseModel):
+    input_text: str
+    response_a: str
+    response_b: str
+    preference: str  # "a" or "b"
+    prompt_mapping: Dict[str, str]  # {"a": "prompt", "b": "prompt_b"}
+    feature: str = "summarize"
 
 @app.get("/feature-flags")
 async def get_feature_flags() -> Dict[str, Any]:
     """Get all feature flags configuration"""
     return FEATURE_FLAGS
+
+@app.post("/feedback")
+async def submit_feedback(request: FeedbackRequest):
+    """Submit thumbs up/down feedback on an AI response."""
+    if not FEATURE_FLAGS.get("feedback", False):
+        raise HTTPException(status_code=404, detail="Feedback feature is not enabled")
+
+    feedback_entry = {
+        "id": len(feedback_store) + 1,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "feature": request.feature,
+        "rating": request.rating,
+        "input_text": request.input_text,
+        "response_text": request.response_text,
+        "comment": request.comment,
+    }
+
+    feedback_store.append(feedback_entry)
+
+    # Structured log for LokiStack (JSON on STDOUT is auto-collected)
+    feedback_logger.info(json.dumps({
+        "event": "feedback_submitted",
+        "feedback_id": feedback_entry["id"],
+        "feature": request.feature,
+        "rating": request.rating,
+        "input_length": len(request.input_text),
+        "response_length": len(request.response_text),
+        "timestamp": feedback_entry["timestamp"],
+    }))
+
+    return {"status": "ok", "feedback_id": feedback_entry["id"]}
+
+
+@app.get("/feedback")
+async def list_feedback():
+    """List all collected feedback entries."""
+    if not FEATURE_FLAGS.get("feedback", False):
+        raise HTTPException(status_code=404, detail="Feedback feature is not enabled")
+
+    return {
+        "total": len(feedback_store),
+        "feedback": feedback_store,
+    }
+
+
+@app.get("/feedback/export")
+async def export_feedback_for_eval():
+    """Export negative feedback as eval-compatible dataset.
+
+    Format matches canopy-evals summary_tests.yaml structure.
+    """
+    if not FEATURE_FLAGS.get("feedback", False):
+        raise HTTPException(status_code=404, detail="Feedback feature is not enabled")
+
+    negative_feedback = [
+        entry for entry in feedback_store if entry["rating"] == "thumbs_down"
+    ]
+
+    tests = []
+    for entry in negative_feedback:
+        tests.append({
+            "prompt": entry["input_text"],
+            "expected_result": "",  # To be filled by human reviewer
+        })
+
+    eval_dataset = {
+        "name": "feedback_eval_tests",
+        "description": "Tests generated from negative user feedback on summarization.",
+        "endpoint": "/summarize",
+        "scoring_params": {
+            "llm-as-judge::base": {
+                "judge_model": "llama32",
+                "prompt_template": "judge_prompt.txt",
+                "type": "llm_as_judge",
+                "judge_score_regexes": ["Answer: (A|B|C|D|E)"],
+            },
+            "basic::subset_of": None,
+        },
+        "tests": tests,
+    }
+
+    yaml_output = yaml.dump(eval_dataset, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+    feedback_logger.info(json.dumps({
+        "event": "feedback_exported",
+        "total_negative": len(negative_feedback),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }))
+
+    return Response(
+        content=yaml_output,
+        media_type="application/x-yaml",
+        headers={"Content-Disposition": "attachment; filename=feedback-eval-dataset.yaml"},
+    )
+
+
+@app.post("/summarize/ab")
+async def summarize_ab(request: PromptRequest):
+    """Run the same input through two different prompts for A/B comparison."""
+    if not FEATURE_FLAGS.get("summarize", False):
+        raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
+    if not FEATURE_FLAGS.get("ab_testing", False):
+        raise HTTPException(status_code=404, detail="A/B testing feature is not enabled")
+
+    prompt_a_text = config["summarize"].get("prompt", "Summarize the following text:")
+    prompt_b_text = config["summarize"].get("prompt_b")
+    if not prompt_b_text:
+        raise HTTPException(status_code=400, detail="prompt_b is not configured in summarize config")
+
+    temperature = config["summarize"].get("temperature", 0.7)
+    max_tokens = config["summarize"].get("max_tokens", 4096)
+    model = config["summarize"]["model"]
+
+    # Randomize which prompt is A vs B to avoid position bias
+    prompts = [("prompt", prompt_a_text), ("prompt_b", prompt_b_text)]
+    random.shuffle(prompts)
+    mapping = {"a": prompts[0][0], "b": prompts[1][0]}
+
+    q = queue.Queue()
+
+    def ab_worker(variant, sys_prompt):
+        """Run inference for one variant and tag chunks."""
+        try:
+            response = llama_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": request.prompt},
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+            for r in response:
+                if hasattr(r, 'choices') and r.choices:
+                    delta = r.choices[0].delta
+                    if delta.content:
+                        chunk = f"data: {json.dumps({'variant': variant, 'delta': delta.content})}\n\n"
+                        q.put(chunk)
+        except Exception as e:
+            q.put(f"data: {json.dumps({'variant': variant, 'error': str(e)})}\n\n")
+        finally:
+            q.put(("DONE", variant))
+
+    # Send config event first, then start workers
+    threading.Thread(target=ab_worker, args=("a", prompts[0][1])).start()
+    threading.Thread(target=ab_worker, args=("b", prompts[1][1])).start()
+
+    async def streamer():
+        # First event: send the mapping (frontend stores but doesn't show)
+        yield f"data: {json.dumps({'type': 'ab_config', 'mapping': mapping})}\n\n"
+        done_count = 0
+        while done_count < 2:
+            item = await asyncio.get_event_loop().run_in_executor(None, q.get)
+            if isinstance(item, tuple) and item[0] == "DONE":
+                done_count += 1
+            else:
+                yield item
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(streamer(), media_type="text/event-stream")
+
+
+@app.post("/feedback/ab")
+async def submit_ab_feedback(request: ABFeedbackRequest):
+    """Submit A/B comparison feedback."""
+    if not FEATURE_FLAGS.get("feedback", False):
+        raise HTTPException(status_code=404, detail="Feedback feature is not enabled")
+    if not FEATURE_FLAGS.get("ab_testing", False):
+        raise HTTPException(status_code=404, detail="A/B testing feature is not enabled")
+
+    # Resolve which actual prompt won
+    winning_prompt = None
+    if request.preference in ("a", "b"):
+        winning_prompt = request.prompt_mapping.get(request.preference)
+
+    ab_entry = {
+        "id": len(ab_feedback_store) + 1,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "feature": request.feature,
+        "preference": request.preference,
+        "winning_prompt": winning_prompt,
+        "prompt_mapping": request.prompt_mapping,
+        "input_text": request.input_text,
+        "response_a": request.response_a,
+        "response_b": request.response_b,
+    }
+
+    ab_feedback_store.append(ab_entry)
+
+    feedback_logger.info(json.dumps({
+        "event": "ab_feedback_submitted",
+        "feedback_id": ab_entry["id"],
+        "feature": request.feature,
+        "preference": request.preference,
+        "winning_prompt": winning_prompt,
+        "prompt_mapping": request.prompt_mapping,
+        "timestamp": ab_entry["timestamp"],
+    }))
+
+    return {"status": "ok", "feedback_id": ab_entry["id"]}
+
+
+@app.get("/feedback/ab")
+async def list_ab_feedback():
+    """List all A/B feedback entries with win-rate stats."""
+    if not FEATURE_FLAGS.get("feedback", False):
+        raise HTTPException(status_code=404, detail="Feedback feature is not enabled")
+    if not FEATURE_FLAGS.get("ab_testing", False):
+        raise HTTPException(status_code=404, detail="A/B testing feature is not enabled")
+
+    prompt_a_wins = sum(1 for e in ab_feedback_store if e["winning_prompt"] == "prompt")
+    prompt_b_wins = sum(1 for e in ab_feedback_store if e["winning_prompt"] == "prompt_b")
+    ties = sum(1 for e in ab_feedback_store if e["preference"] == "tie")
+
+    return {
+        "total": len(ab_feedback_store),
+        "prompt_a_wins": prompt_a_wins,
+        "prompt_b_wins": prompt_b_wins,
+        "ties": ties,
+        "entries": ab_feedback_store,
+    }
+
 
 @app.post("/summarize")
 async def summarize(request: PromptRequest):
@@ -178,33 +449,115 @@ async def summarize(request: PromptRequest):
     sys_prompt = config["summarize"].get("prompt", "Summarize the following text:")
     temperature = config["summarize"].get("temperature", 0.7)
     max_tokens = config["summarize"].get("max_tokens", 4096)
+    model = config["summarize"]["model"]
 
     q = queue.Queue()
 
-    def worker():
-        print(f"sending requestion to model {config['summarize']['model']}")
+    def worker_with_shields():
+        """Use Responses API when shields are enabled - guardrails handled server-side."""
+        print(f"sending request to model {model} with shields (Responses API)")
         try:
-            response = llama_client.chat.completions.create(
-                model=config["summarize"]["model"],
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": request.prompt},
-                ],
-                max_tokens=max_tokens, 
+            input_shields = SHIELDS_CONFIG.get("input_shields", [])
+            output_shields = SHIELDS_CONFIG.get("output_shields", [])
+            # Combine input and output shields for guardrails
+            guardrails = list(set(input_shields + output_shields))
+
+            # Use Responses API with guardrails
+            response = llama_client.responses.create(
+                model=model,
+                instructions=sys_prompt,
+                input=[{"role": "user", "content": request.prompt, "type": "message"}],
                 temperature=temperature,
                 stream=True,
+                extra_body={"guardrails": guardrails} if guardrails else None,
             )
-            for r in response:
-                if hasattr(r, 'choices') and r.choices:
-                    delta = r.choices[0].delta
-                    chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
+
+            for event in response:
+                # Handle different event types
+                event_type = getattr(event, 'type', None)
+                print(f"[Responses API] Event type: {event_type}")
+                print(f"[Responses API] Event: {event}")
+
+                # Handle text delta streaming
+                if event_type == 'response.output_text.delta':
+                    delta_text = getattr(event, 'delta', '')
+                    if delta_text:
+                        print(f"[Responses API] Delta: {delta_text}")
+                        chunk = f"data: {json.dumps({'delta': delta_text})}\n\n"
+                        q.put(chunk)
+
+                # Handle response failure (includes guardrail violations)
+                elif event_type == 'response.failed':
+                    error_msg = 'Response generation failed'
+                    if hasattr(event, 'response') and hasattr(event.response, 'error'):
+                        error_msg = getattr(event.response.error, 'message', error_msg)
+                    print(f"[Responses API] Failed: {error_msg}")
+                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
                     q.put(chunk)
+                    break
+
+                # Handle completed response
+                elif event_type == 'response.completed':
+                    print(f"[Responses API] Completed")
+                    if hasattr(event, 'response'):
+                        resp = event.response
+                        # Check for refusal in output (guardrail violation)
+                        if hasattr(resp, 'output') and resp.output:
+                            for output_msg in resp.output:
+                                if hasattr(output_msg, 'content') and output_msg.content:
+                                    for content_item in output_msg.content:
+                                        if isinstance(content_item, dict) and content_item.get('type') == 'refusal':
+                                            error_msg = "Your request was blocked by our safety guardrails"
+                                            print(f"[Responses API] Guardrail refusal detected")
+                                            chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
+                                            q.put(chunk)
+                                            return
+                        # Check if response has error status
+                        if hasattr(resp, 'status') and resp.status == 'failed':
+                            error_msg = 'Content blocked by safety guardrails'
+                            if hasattr(resp, 'error') and resp.error:
+                                error_msg = getattr(resp.error, 'message', error_msg)
+                            print(f"[Responses API] Guardrail violation: {error_msg}")
+                            chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
+                            q.put(chunk)
+
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
             q.put(None)
 
-    threading.Thread(target=worker).start()
+    def worker_without_shields():
+        """Use direct inference API when shields are disabled."""
+        print(f"sending request to model {model} without shields (Inference API)")
+        try:
+            response = llama_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": request.prompt},
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+
+            for r in response:
+                if hasattr(r, 'choices') and r.choices:
+                    delta = r.choices[0].delta
+                    if delta.content:
+                        chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
+                        q.put(chunk)
+
+        except Exception as e:
+            q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
+        finally:
+            q.put(None)
+
+    # Choose worker based on shields feature flag
+    if FEATURE_FLAGS.get("shields", False):
+        threading.Thread(target=worker_with_shields).start()
+    else:
+        threading.Thread(target=worker_without_shields).start()
 
     async def streamer():
         while True:

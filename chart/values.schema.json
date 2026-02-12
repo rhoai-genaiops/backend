@@ -44,9 +44,20 @@
         "temperature": {
           "type": "number",
           "description": "Temperature for the model"
+        },
+        "prompt_b": {
+          "type": "string",
+          "description": "Alternative prompt for A/B testing",
+          "minLength": 1
         }
       },
-      "required": ["enabled", "model", "prompt"],
+      "required": ["enabled"],
+      "if": {
+        "properties": { "enabled": { "const": true } }
+      },
+      "then": {
+        "required": ["model", "prompt"]
+      },
       "additionalProperties": false
     },
     "information-search": {
@@ -107,7 +118,13 @@
           "examples": []
         }
       },
-      "required": ["enabled", "model", "prompt"],
+      "required": ["enabled"],
+      "if": {
+        "properties": { "enabled": { "const": true } }
+      },
+      "then": {
+        "required": ["model", "prompt"]
+      },
       "additionalProperties": false
     },
     "student-assistant": {
@@ -172,7 +189,69 @@
           "examples": []
         }
       },
-      "required": ["enabled", "model"],
+      "required": ["enabled"],
+      "if": {
+        "properties": { "enabled": { "const": true } }
+      },
+      "then": {
+        "required": ["model"]
+      },
+      "additionalProperties": false
+    },
+    "shields": {
+      "type": "object",
+      "description": "Configuration for input/output moderation shields",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable or disable shields functionality",
+          "default": false
+        },
+        "input_shields": {
+          "type": "array",
+          "description": "Shield names for input moderation",
+          "items": {
+            "type": "string"
+          },
+          "examples": [
+            ["hap", "language_detection", "prompt_injection"]
+          ]
+        },
+        "output_shields": {
+          "type": "array",
+          "description": "Shield names for output moderation",
+          "items": {
+            "type": "string"
+          },
+          "examples": [
+            []
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "feedback": {
+      "type": "object",
+      "description": "Configuration for user feedback collection on AI responses",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable or disable feedback collection functionality",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "ab_testing": {
+      "type": "object",
+      "description": "Configuration for A/B testing of prompts",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable or disable A/B testing",
+          "default": false
+        }
+      },
       "additionalProperties": false
     }
   },
