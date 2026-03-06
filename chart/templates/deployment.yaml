@@ -24,7 +24,7 @@ spec:
     spec:
       containers:
         - name: canopy-backend
-          image: quay.io/rhoai-genaiops/canopy-be:0.14
+          image: quay.io/rhoai-genaiops/canopy-be:0.15
           ports:
             - containerPort: 8000
           env:

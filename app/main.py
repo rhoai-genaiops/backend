@@ -199,6 +199,14 @@ ab_feedback_store: List[Dict[str, Any]] = []
 class PromptRequest(BaseModel):
     prompt: str
 
+class ChatMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
+    session_id: Optional[str] = None
+
 class FeedbackRequest(BaseModel):
     input_text: str
     response_text: str
@@ -538,6 +546,120 @@ async def summarize(request: PromptRequest):
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": request.prompt},
                 ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+
+            for r in response:
+                if hasattr(r, 'choices') and r.choices:
+                    delta = r.choices[0].delta
+                    if delta.content:
+                        chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
+                        q.put(chunk)
+
+        except Exception as e:
+            q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
+        finally:
+            q.put(None)
+
+    # Choose worker based on shields feature flag
+    if FEATURE_FLAGS.get("shields", False):
+        threading.Thread(target=worker_with_shields).start()
+    else:
+        threading.Thread(target=worker_without_shields).start()
+
+    async def streamer():
+        while True:
+            chunk = await asyncio.get_event_loop().run_in_executor(None, q.get)
+            if chunk is None:
+                break
+            yield chunk
+
+    return StreamingResponse(streamer(), media_type="text/event-stream")
+
+@app.post("/summarize/chat")
+async def summarize_chat(request: ChatRequest):
+    """Chat endpoint for summarization with conversation history."""
+    if not FEATURE_FLAGS.get("summarize", False):
+        raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
+
+    sys_prompt = config["summarize"].get("prompt", "Summarize the following text:")
+    temperature = config["summarize"].get("temperature", 0.7)
+    max_tokens = config["summarize"].get("max_tokens", 4096)
+    model = config["summarize"]["model"]
+
+    # Convert ChatMessage objects to dict format for the LLM
+    messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+
+    q = queue.Queue()
+
+    def worker_with_shields():
+        """Use Responses API when shields are enabled."""
+        print(f"sending chat request to model {model} with shields (Responses API)")
+        try:
+            input_shields = SHIELDS_CONFIG.get("input_shields", [])
+            output_shields = SHIELDS_CONFIG.get("output_shields", [])
+            guardrails = list(set(input_shields + output_shields))
+
+            # Convert messages to the responses API format
+            input_messages = [{"role": msg["role"], "content": msg["content"], "type": "message"} for msg in messages]
+
+            response = llama_client.responses.create(
+                model=model,
+                instructions=sys_prompt,
+                input=input_messages,
+                temperature=temperature,
+                stream=True,
+                extra_body={"guardrails": guardrails} if guardrails else None,
+            )
+
+            for event in response:
+                event_type = getattr(event, 'type', None)
+                print(f"[Responses API] Event type: {event_type}")
+
+                if event_type == 'response.output_text.delta':
+                    delta_text = getattr(event, 'delta', '')
+                    if delta_text:
+                        chunk = f"data: {json.dumps({'delta': delta_text})}\n\n"
+                        q.put(chunk)
+
+                elif event_type == 'response.failed':
+                    error_msg = 'Response generation failed'
+                    if hasattr(event, 'response') and hasattr(event.response, 'error'):
+                        error_msg = getattr(event.response.error, 'message', error_msg)
+                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
+                    q.put(chunk)
+                    break
+
+                elif event_type == 'response.completed':
+                    if hasattr(event, 'response'):
+                        resp = event.response
+                        if hasattr(resp, 'output') and resp.output:
+                            for output_msg in resp.output:
+                                if hasattr(output_msg, 'content') and output_msg.content:
+                                    for content_item in output_msg.content:
+                                        if isinstance(content_item, dict) and content_item.get('type') == 'refusal':
+                                            error_msg = "Your request was blocked by our safety guardrails"
+                                            chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
+                                            q.put(chunk)
+                                            return
+
+        except Exception as e:
+            q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
+        finally:
+            q.put(None)
+
+    def worker_without_shields():
+        """Use direct inference API when shields are disabled."""
+        print(f"sending chat request to model {model} without shields (Inference API)")
+        try:
+            # Prepend system message
+            full_messages = [{"role": "system", "content": sys_prompt}] + messages
+
+            response = llama_client.chat.completions.create(
+                model=model,
+                messages=full_messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
