@@ -622,20 +622,9 @@ def vector_database_component(
         return VectorDBOutput(vector_db_status=vector_db_status, vector_db_ids=created_db_ids)
         
     except Exception as e:
-        error_msg = f"Vector database registration failed: {e}"
-        print(error_msg)
+        print(f"Vector database registration failed: {e}")
         print("Check LlamaStack service and Milvus backend availability")
-
-        # Return error status
-        vector_db_status = {
-            "status": "error",
-            "error_message": str(e),
-            "vector_db_id": vector_db_id,
-            "ready_for_ingestion": False
-        }
-
-        VectorDBOutput = namedtuple("VectorDBOutput", ["vector_db_status", "vector_db_ids"])
-        return VectorDBOutput(vector_db_status=vector_db_status, vector_db_ids=[])
+        raise
 
 # =============================================================================
 # COMPONENT 5: BATCH DOCUMENT INGESTION
