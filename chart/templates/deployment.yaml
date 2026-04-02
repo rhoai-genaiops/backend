@@ -45,6 +45,12 @@ spec:
               value: "http://trace-collector-collector.{{ .Values.toolingsNamespace | default (printf "%s-toolings" (trimSuffix "-canopy" .Release.Namespace | trimSuffix "-test" | trimSuffix "-prod")) }}.svc.cluster.local:4318"
             - name: TELEMETRY_SINKS
               value: "otel_trace"
+            - name: MLFLOW_TRACKING_URI
+              value: "{{ .Values.MLFLOW_TRACKING_URI }}"
+            - name: MLFLOW_PROMPT_VERSION
+              value: "{{ .Values.MLFLOW_PROMPT_VERSION | default "latest" }}"
+            - name: MLFLOW_TRACKING_INSECURE_TLS
+              value: "true"
           volumeMounts:
             - mountPath: /canopy
               name: canopy-config

@@ -16,8 +16,43 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 import random
+import mlflow
 
 app = FastAPI(title="Canopy Backend API")
+
+# MLflow prompt registry configuration
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI")
+MLFLOW_PROMPT_VERSION = os.getenv("MLFLOW_PROMPT_VERSION")
+if not os.getenv("MLFLOW_TRACKING_AUTH"):
+    os.environ["MLFLOW_TRACKING_AUTH"] = "kubernetes"
+if not os.getenv("MLFLOW_TRACKING_INSECURE_TLS"):
+    os.environ["MLFLOW_TRACKING_INSECURE_TLS"] = "true"
+
+if not os.getenv("MLFLOW_WORKSPACE"):
+    NAMESPACE_PATH = "/run/secrets/kubernetes.io/serviceaccount/namespace"
+    if os.path.exists(NAMESPACE_PATH):
+        with open(NAMESPACE_PATH) as f:
+            os.environ["MLFLOW_WORKSPACE"] = f.read().strip()
+
+SA_TOKEN_PATH = "/run/secrets/kubernetes.io/serviceaccount/token"
+if os.path.exists(SA_TOKEN_PATH):
+    with open(SA_TOKEN_PATH) as f:
+        os.environ["MLFLOW_TRACKING_TOKEN"] = f.read().strip()
+
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+
+def get_mlflow_prompt(feature):
+    """Fetch system prompt from MLflow prompt registry for a given feature.
+
+    The MLflow prompt name is read from config[feature]["mlflow_prompt"].
+    """
+    prompt_name = config[feature]["mlflow_prompt"]
+    version = MLFLOW_PROMPT_VERSION or "latest"
+    if version == "latest":
+        prompt = mlflow.genai.load_prompt(f"prompts:/{prompt_name}@{version}")
+    else:
+        prompt = mlflow.genai.load_prompt(f"prompts:/{prompt_name}/{version}")
+    return prompt.template
 
 # Load configuration with fallback for testing
 config_path = os.getenv("CANOPY_CONFIG_PATH", "/canopy/canopy-config.yaml")
@@ -172,7 +207,7 @@ if FEATURE_FLAGS.get("student-assistant", False):
     )
 
     # Evaluate the prompt as an f-string to execute any Python expressions in {}
-    prompt_template = config["student-assistant"].get("prompt", "You are a helpful university assistant.")
+    prompt_template = get_mlflow_prompt("student-assistant")
     formatted_prompt = eval(f'f"""{prompt_template}"""')
 
     agent = create_react_agent(
@@ -330,7 +365,7 @@ async def summarize_ab(request: PromptRequest):
     if not FEATURE_FLAGS.get("ab_testing", False):
         raise HTTPException(status_code=404, detail="A/B testing feature is not enabled")
 
-    prompt_a_text = config["summarize"].get("prompt", "Summarize the following text:")
+    prompt_a_text = get_mlflow_prompt("summarize")
     prompt_b_text = config["summarize"].get("prompt_b")
     if not prompt_b_text:
         raise HTTPException(status_code=400, detail="prompt_b is not configured in summarize config")
@@ -456,7 +491,7 @@ async def summarize(request: PromptRequest):
     if not FEATURE_FLAGS.get("summarize", False):
         raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
 
-    sys_prompt = config["summarize"].get("prompt", "Summarize the following text:")
+    sys_prompt = get_mlflow_prompt("summarize")
     temperature = config["summarize"].get("temperature", 0.7)
     max_tokens = config["summarize"].get("max_tokens", 4096)
     model = config["summarize"]["model"]
@@ -584,7 +619,7 @@ async def summarize_chat(request: ChatRequest):
     if not FEATURE_FLAGS.get("summarize", False):
         raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
 
-    sys_prompt = config["summarize"].get("prompt", "Summarize the following text:")
+    sys_prompt = get_mlflow_prompt("summarize")
     temperature = config["summarize"].get("temperature", 0.7)
     max_tokens = config["summarize"].get("max_tokens", 4096)
     model = config["summarize"]["model"]
@@ -698,7 +733,7 @@ async def socratic_tutor(request: PromptRequest):
     if not FEATURE_FLAGS.get("socratic-tutor", False):
         raise HTTPException(status_code=404, detail="Socratic tutor feature is not enabled")
 
-    sys_prompt = config["socratic-tutor"].get("prompt", "Help the student discover the answer through questioning:")
+    sys_prompt = get_mlflow_prompt("socratic-tutor")
     temperature = config["socratic-tutor"].get("temperature", 0.9)
     max_tokens = config["socratic-tutor"].get("max_tokens", 1500)
     model = config["socratic-tutor"]["model"]
@@ -761,7 +796,7 @@ async def information_search(request: PromptRequest):
         raise HTTPException(status_code=404, detail="Information search feature is not enabled")
 
     # Dummy information search implementation
-    sys_prompt = config["information-search"]["prompt"]
+    sys_prompt = get_mlflow_prompt("information-search")
     temperature = config["information-search"].get("temperature", 0.7)
     max_tokens = config["information-search"].get("max_tokens", 4096)
     vector_db_id = config["information-search"].get("vector_db_id", "latest")

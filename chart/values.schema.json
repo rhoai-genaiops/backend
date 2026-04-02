@@ -14,6 +14,23 @@
         "https://my-llama-service.example.com"
       ]
     },
+    "MLFLOW_TRACKING_URI": {
+      "type": "string",
+      "description": "MLflow tracking server URI",
+      "examples": [
+        "https://mlflow.apps.example.com/mlflow"
+      ]
+    },
+    "MLFLOW_PROMPT_VERSION": {
+      "type": "string",
+      "description": "MLflow prompt version to fetch (alias or number)",
+      "default": "latest",
+      "examples": [
+        "latest",
+        "1",
+        "2"
+      ]
+    },
     "summarize": {
       "type": "object",
       "description": "Configuration for summarization functionality",
@@ -49,6 +66,11 @@
           "type": "string",
           "description": "Alternative prompt for A/B testing",
           "minLength": 1
+        },
+        "mlflow_prompt": {
+          "type": "string",
+          "description": "MLflow prompt registry name for this feature",
+          "examples": ["summarization"]
         }
       },
       "required": ["enabled"],
@@ -56,7 +78,7 @@
         "properties": { "enabled": { "const": true } }
       },
       "then": {
-        "required": ["model", "prompt"]
+        "required": ["model", "mlflow_prompt"]
       },
       "additionalProperties": false
     },
@@ -116,6 +138,11 @@
           "type": "string",
           "description": "Target Revision for the Helm chart",
           "examples": []
+        },
+        "mlflow_prompt": {
+          "type": "string",
+          "description": "MLflow prompt registry name for this feature",
+          "examples": ["information-search"]
         }
       },
       "required": ["enabled"],
@@ -123,7 +150,7 @@
         "properties": { "enabled": { "const": true } }
       },
       "then": {
-        "required": ["model", "prompt"]
+        "required": ["model", "mlflow_prompt"]
       },
       "additionalProperties": false
     },
@@ -187,6 +214,11 @@
           "type": "string",
           "description": "Target Revision for the Helm chart",
           "examples": []
+        },
+        "mlflow_prompt": {
+          "type": "string",
+          "description": "MLflow prompt registry name for this feature",
+          "examples": ["student-assistant"]
         }
       },
       "required": ["enabled"],
@@ -194,7 +226,7 @@
         "properties": { "enabled": { "const": true } }
       },
       "then": {
-        "required": ["model"]
+        "required": ["model", "mlflow_prompt"]
       },
       "additionalProperties": false
     },
@@ -284,6 +316,11 @@
         "temperature": {
           "type": "number",
           "description": "Temperature for the model"
+        },
+        "mlflow_prompt": {
+          "type": "string",
+          "description": "MLflow prompt registry name for this feature",
+          "examples": ["socratic-tutor"]
         }
       },
       "required": ["enabled"],
@@ -291,11 +328,11 @@
         "properties": { "enabled": { "const": true } }
       },
       "then": {
-        "required": ["model", "prompt"]
+        "required": ["model", "mlflow_prompt"]
       },
       "additionalProperties": false
     }
   },
-  "required": ["LLAMA_STACK_URL"],
+  "required": ["LLAMA_STACK_URL", "MLFLOW_TRACKING_URI"],
   "additionalProperties": false
 }

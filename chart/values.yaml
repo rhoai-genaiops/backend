@@ -1,1 +1,3 @@
 LLAMA_STACK_URL: "http://llama-stack-service:8321"
+MLFLOW_TRACKING_URI: ""
+MLFLOW_PROMPT_VERSION: "latest"

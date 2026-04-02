@@ -1,0 +1,15 @@
+
+LLAMA_STACK_URL: "http://llamastack-user1-canopy.apps.cluster-sd7hw.sd7hw.sandbox5218.opentlc.com"
+summarize:
+  enabled: true
+  model: vllm-llama32/llama32
+  temperature: 0.9
+  max_tokens: 4096
+  prompt: |
+    You are an assistant that summarizes the given content.
+  prompt_b: |
+    You are an assistant that summarizes the given content. Please provide a concise summary in emojis.
+feedback:
+  enabled: true
+# ab_testing:
+#   enabled: false
