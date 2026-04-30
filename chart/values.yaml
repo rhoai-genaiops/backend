@@ -1,12 +1,12 @@
 MLFLOW_TRACKING_URI: "https://mlflow.redhat-ods-applications.svc.cluster.local:8443"
 
-summarize:
+summarization:
   enabled: true
   endpoint: "http://llama-32-predictor:80/v1"
   model: llama32
   temperature: 0.9
   max_tokens: 4096
-  mlflow_prompt: summarize
+  mlflow_prompt: summarization
 
 socratic-tutor:
   enabled: false

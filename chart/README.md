@@ -46,14 +46,14 @@ Each feature declares its own `endpoint` — the URL of the model server (e.g. v
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `summarize.enabled` | Enable summarization functionality | `true` |
-| `summarize.endpoint` | Model endpoint URL | `http://llama-32-predictor:80/v1` |
-| `summarize.model` | Model identifier | `llama32` |
-| `summarize.temperature` | Temperature for generation | `0.9` |
-| `summarize.max_tokens` | Max tokens for generation | `4096` |
-| `summarize.mlflow_prompt` | MLflow prompt registry name | `summarize` |
-| `summarize.mlflow_prompt_version` | MLflow prompt version | `latest` |
-| `summarize.prompt_b` | Alternative prompt for A/B testing | - |
+| `summarization.enabled` | Enable summarization functionality | `true` |
+| `summarization.endpoint` | Model endpoint URL | `http://llama-32-predictor:80/v1` |
+| `summarization.model` | Model identifier | `llama32` |
+| `summarization.temperature` | Temperature for generation | `0.9` |
+| `summarization.max_tokens` | Max tokens for generation | `4096` |
+| `summarization.mlflow_prompt` | MLflow prompt registry name | `summarization` |
+| `summarization.mlflow_prompt_version` | MLflow prompt version | `latest` |
+| `summarization.prompt_b` | Alternative prompt for A/B testing | - |
 
 ### Information Search
 
@@ -137,17 +137,17 @@ This chart creates the following Kubernetes resources:
 
 ## Examples
 
-### Basic Installation (summarize only)
+### Basic Installation (summarization only)
 
 ```yaml
 # custom-values.yaml
 MLFLOW_TRACKING_URI: "https://mlflow.apps.example.com"
 
-summarize:
+summarization:
   enabled: true
   endpoint: "http://llama-32-predictor:80/v1"
   model: llama32
-  mlflow_prompt: summarize
+  mlflow_prompt: summarization
 
 feedback:
   enabled: true
@@ -159,11 +159,11 @@ feedback:
 # custom-values.yaml
 MLFLOW_TRACKING_URI: "https://mlflow.apps.example.com"
 
-summarize:
+summarization:
   enabled: true
   endpoint: "http://llama-32-predictor:80/v1"
   model: llama32
-  mlflow_prompt: summarize
+  mlflow_prompt: summarization
 
 information-search:
   enabled: true

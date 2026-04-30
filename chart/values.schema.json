@@ -30,7 +30,7 @@
       "type": "string",
       "description": "URL of the source repository"
     },
-    "summarize": {
+    "summarization": {
       "type": "object",
       "description": "Configuration for summarization functionality",
       "properties": {
@@ -60,7 +60,7 @@
         "mlflow_prompt": {
           "type": "string",
           "description": "MLflow prompt registry name for this feature",
-          "examples": ["summarize"]
+          "examples": ["summarization"]
         },
         "mlflow_prompt_version": {
           "type": "string",

@@ -1,5 +1,5 @@
 
-summarize:
+summarization:
   enabled: true
   endpoint: "http://llama-32-predictor.ai501.svc.cluster.local:80/v1"
   model: llama32

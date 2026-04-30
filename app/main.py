@@ -51,7 +51,6 @@ if os.path.exists(SA_TOKEN_PATH):
         os.environ["MLFLOW_TRACKING_TOKEN"] = f.read().strip()
 
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-mlflow.set_experiment("canopy-backend")
 mlflow.openai.autolog()
 mlflow.langchain.autolog()
 logging.getLogger("mlflow.langchain.langchain_tracer").setLevel(logging.ERROR)
@@ -101,7 +100,7 @@ if os.path.exists(config_path):
     # Feature flags configuration from environment variables
     FEATURE_FLAGS = {
         "information-search": "information-search" in config and config["information-search"]["enabled"] == True,
-        "summarize": "summarize" in config and config["summarize"]["enabled"] == True,
+        "summarization": "summarization" in config and config["summarization"]["enabled"] == True,
         "student-assistant": "student-assistant" in config and config["student-assistant"]["enabled"] == True,
         "shields": "shields" in config and config["shields"]["enabled"] == True,
         "feedback": "feedback" in config and config["feedback"]["enabled"] == True,
@@ -125,7 +124,7 @@ else:
     def get_llama_client(feature): return None
     FEATURE_FLAGS = {
         "information-search": False,
-        "summarize": False,
+        "summarization": False,
         "student-assistant": False,
         "shields": False,
         "feedback": False,
@@ -283,7 +282,7 @@ class FeedbackRequest(BaseModel):
     input_text: str
     response_text: str
     rating: str  # "thumbs_up" or "thumbs_down"
-    feature: str = "summarize"
+    feature: str = "summarization"
     comment: Optional[str] = None
 
 class ABFeedbackRequest(BaseModel):
@@ -292,7 +291,7 @@ class ABFeedbackRequest(BaseModel):
     response_b: str
     preference: str  # "a" or "b"
     prompt_mapping: Dict[str, str]  # {"a": "prompt", "b": "prompt_b"}
-    feature: str = "summarize"
+    feature: str = "summarization"
 
 @app.get("/feature-flags")
 async def get_feature_flags() -> Dict[str, Any]:
@@ -366,7 +365,7 @@ async def export_feedback_for_eval():
     eval_dataset = {
         "name": "feedback_eval_tests",
         "description": "Tests generated from negative user feedback on summarization.",
-        "endpoint": "/summarize",
+        "endpoint": "/summarization",
         "scoring_params": {
             "llm-as-judge::base": {
                 "judge_model": "llama32",
@@ -394,23 +393,23 @@ async def export_feedback_for_eval():
     )
 
 
-@app.post("/summarize/ab")
-async def summarize_ab(request: PromptRequest, raw_request: Request):
+@app.post("/summarization/ab")
+async def summarization_ab(request: PromptRequest, raw_request: Request):
     """Run the same input through two different prompts for A/B comparison."""
-    if not FEATURE_FLAGS.get("summarize", False):
+    if not FEATURE_FLAGS.get("summarization", False):
         raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
     if not FEATURE_FLAGS.get("ab_testing", False):
         raise HTTPException(status_code=404, detail="A/B testing feature is not enabled")
 
     session_id = raw_request.headers.get("x-session-id")
-    prompt_a_text = get_mlflow_prompt("summarize")
-    prompt_b_text = config["summarize"].get("prompt_b")
+    prompt_a_text = get_mlflow_prompt("summarization")
+    prompt_b_text = config["summarization"].get("prompt_b")
     if not prompt_b_text:
-        raise HTTPException(status_code=400, detail="prompt_b is not configured in summarize config")
+        raise HTTPException(status_code=400, detail="prompt_b is not configured in summarization config")
 
-    temperature = config["summarize"].get("temperature", 0.7)
-    max_tokens = config["summarize"].get("max_tokens", 4096)
-    model = config["summarize"]["model"]
+    temperature = config["summarization"].get("temperature", 0.7)
+    max_tokens = config["summarization"].get("max_tokens", 4096)
+    model = config["summarization"]["model"]
 
     # Randomize which prompt is A vs B to avoid position bias
     prompts = [("prompt", prompt_a_text), ("prompt_b", prompt_b_text)]
@@ -422,7 +421,7 @@ async def summarize_ab(request: PromptRequest, raw_request: Request):
     def ab_worker(variant, sys_prompt):
         """Run inference for one variant and tag chunks."""
         try:
-            response = get_openai_client("summarize").chat.completions.create(
+            response = get_openai_client("summarization").chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": sys_prompt},
@@ -523,29 +522,29 @@ async def list_ab_feedback():
     }
 
 
-@app.post("/summarize")
-async def summarize(request: PromptRequest, raw_request: Request):
-    # Check if summarization feature is enabled
-    if not FEATURE_FLAGS.get("summarize", False):
+@app.post("/summarization")
+async def summarization(request: PromptRequest, raw_request: Request):
+    if not FEATURE_FLAGS.get("summarization", False):
         raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
 
-    sys_prompt = get_mlflow_prompt("summarize")
-    temperature = config["summarize"].get("temperature", 0.7)
-    max_tokens = config["summarize"].get("max_tokens", 4096)
-    model = config["summarize"]["model"]
+    sys_prompt = get_mlflow_prompt("summarization")
+    temperature = config["summarization"].get("temperature", 0.7)
+    max_tokens = config["summarization"].get("max_tokens", 4096)
+    model = config["summarization"]["model"]
     session_id = raw_request.headers.get("x-session-id")
 
     q = queue.Queue()
 
     @mlflow.trace
     def worker(messages: list[dict], session_id: str):
+        mlflow.set_experiment("summarization")
         mlflow.update_current_trace(
             metadata={"mlflow.trace.session": session_id},
         )
         print(f"sending request to model {model} (direct model endpoint)")
         full_response = ""
         try:
-            response = get_openai_client("summarize").chat.completions.create(
+            response = get_openai_client("summarization").chat.completions.create(
                 model=model,
                 messages=messages,
                 max_tokens=max_tokens,
@@ -579,16 +578,16 @@ async def summarize(request: PromptRequest, raw_request: Request):
 
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
-@app.post("/summarize/chat")
-async def summarize_chat(request: ChatRequest, raw_request: Request):
+@app.post("/summarization/chat")
+async def summarization_chat(request: ChatRequest, raw_request: Request):
     """Chat endpoint for summarization with conversation history."""
-    if not FEATURE_FLAGS.get("summarize", False):
+    if not FEATURE_FLAGS.get("summarization", False):
         raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
 
-    sys_prompt = get_mlflow_prompt("summarize")
-    temperature = config["summarize"].get("temperature", 0.7)
-    max_tokens = config["summarize"].get("max_tokens", 4096)
-    model = config["summarize"]["model"]
+    sys_prompt = get_mlflow_prompt("summarization")
+    temperature = config["summarization"].get("temperature", 0.7)
+    max_tokens = config["summarization"].get("max_tokens", 4096)
+    model = config["summarization"]["model"]
     session_id = raw_request.headers.get("x-session-id") or request.session_id
 
     # Convert ChatMessage objects to dict format for the LLM
@@ -655,13 +654,14 @@ async def summarize_chat(request: ChatRequest, raw_request: Request):
     @mlflow.trace
     def worker_without_shields(messages: list[dict], session_id: str):
         """Use direct inference API when shields are disabled."""
+        mlflow.set_experiment("summarization")
         mlflow.update_current_trace(
             metadata={"mlflow.trace.session": session_id},
         )
         print(f"sending chat request to model {model} without shields (Inference API)")
         full_response = ""
         try:
-            response = get_openai_client("summarize").chat.completions.create(
+            response = get_openai_client("summarization").chat.completions.create(
                 model=model,
                 messages=messages,
                 max_tokens=max_tokens,
@@ -833,6 +833,7 @@ async def student_assistant_chat(request: PromptRequest, raw_request: Request):
 
     @mlflow.trace(name="student-assistant", span_type="AGENT")
     def run_agent(prompt: str) -> str:
+        mlflow.set_experiment("student-assistant")
         thread_id = session_id or str(int(random.random() * 1000000))
         config_params = {"configurable": {"thread_id": thread_id}}
         inputs = {"messages": [{"role": "user", "content": prompt}]}
