@@ -535,9 +535,10 @@ async def summarization(request: PromptRequest, raw_request: Request):
 
     q = queue.Queue()
 
+    mlflow.set_experiment("summarization")
+
     @mlflow.trace
     def worker(messages: list[dict], session_id: str):
-        mlflow.set_experiment("summarization")
         mlflow.update_current_trace(
             metadata={"mlflow.trace.session": session_id},
         )
@@ -651,10 +652,11 @@ async def summarization_chat(request: ChatRequest, raw_request: Request):
         finally:
             q.put(None)
 
+    mlflow.set_experiment("summarization")
+
     @mlflow.trace
     def worker_without_shields(messages: list[dict], session_id: str):
         """Use direct inference API when shields are disabled."""
-        mlflow.set_experiment("summarization")
         mlflow.update_current_trace(
             metadata={"mlflow.trace.session": session_id},
         )
@@ -710,14 +712,18 @@ async def socratic_tutor(request: PromptRequest, raw_request: Request):
 
     q = queue.Queue()
 
-    def worker():
+    mlflow.set_experiment("socratic-tutor")
+
+    @mlflow.trace
+    def worker(messages: list[dict], session_id: str):
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": session_id},
+        )
+        full_response = ""
         try:
             response = get_openai_client("socratic-tutor").chat.completions.create(
                 model=model,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": request.prompt},
-                ],
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
@@ -727,6 +733,7 @@ async def socratic_tutor(request: PromptRequest, raw_request: Request):
                 if hasattr(r, 'choices') and r.choices:
                     delta = r.choices[0].delta
                     if delta.content:
+                        full_response += delta.content
                         chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
                         q.put(chunk)
 
@@ -734,8 +741,13 @@ async def socratic_tutor(request: PromptRequest, raw_request: Request):
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
             q.put(None)
+        return full_response
 
-    threading.Thread(target=worker).start()
+    socratic_messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": request.prompt},
+    ]
+    threading.Thread(target=worker, args=(socratic_messages, session_id)).start()
 
     async def streamer():
         while True:
@@ -787,14 +799,24 @@ async def information_search(request: PromptRequest, raw_request: Request):
 
     Note: The context includes intelligently processed content with preserved tables, formulas, figures, and document structure."""
 
-    def worker():
+    mlflow.set_experiment("information-search")
+
+    @mlflow.trace
+    def worker(messages: list[dict], query: str, chunks: list[str], vector_store: str, session_id: str):
+        mlflow.update_current_trace(
+            metadata={
+                "mlflow.trace.session": session_id,
+                "vector_store_id": vector_store,
+                "query": query,
+                "retrieved_chunks": chunks,
+                "num_chunks_retrieved": len(chunks),
+            },
+        )
+        full_response = ""
         try:
             response = get_openai_client("information-search").chat.completions.create(
                 model=config["information-search"]["model"],
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": enhaned_prompt},
-                ],
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
@@ -802,14 +824,21 @@ async def information_search(request: PromptRequest, raw_request: Request):
             for r in response:
                 if hasattr(r, 'choices') and r.choices:
                     delta = r.choices[0].delta
-                    chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
-                    q.put(chunk)
+                    if delta.content:
+                        full_response += delta.content
+                        chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
+                        q.put(chunk)
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
             q.put(None)
+        return full_response
 
-    threading.Thread(target=worker).start()
+    search_messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": enhaned_prompt},
+    ]
+    threading.Thread(target=worker, args=(search_messages, request.prompt, retrieved_chunks, vector_db_id, session_id)).start()
 
     async def streamer():
         while True:
@@ -831,9 +860,10 @@ async def student_assistant_chat(request: PromptRequest, raw_request: Request):
     session_id = raw_request.headers.get("x-session-id")
     q = queue.Queue()
 
+    mlflow.set_experiment("student-assistant")
+
     @mlflow.trace(name="student-assistant", span_type="AGENT")
     def run_agent(prompt: str) -> str:
-        mlflow.set_experiment("student-assistant")
         thread_id = session_id or str(int(random.random() * 1000000))
         config_params = {"configurable": {"thread_id": thread_id}}
         inputs = {"messages": [{"role": "user", "content": prompt}]}

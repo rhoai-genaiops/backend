@@ -30,6 +30,10 @@
       "type": "string",
       "description": "URL of the source repository"
     },
+    "target_revision": {
+      "type": "string",
+      "description": "Git revision (branch, tag, or commit) used by the ApplicationSet"
+    },
     "summarization": {
       "type": "object",
       "description": "Configuration for summarization functionality",
