@@ -87,14 +87,17 @@ if os.path.exists(config_path):
     def get_openai_client(feature):
         endpoint = config[feature]["endpoint"]
         if endpoint not in _openai_clients:
-            _openai_clients[endpoint] = OpenAI(base_url=endpoint, api_key="no-key-required")
+            base_url = endpoint if endpoint.endswith('/') else endpoint + '/'
+            _openai_clients[endpoint] = OpenAI(base_url=base_url, api_key="no-key-required")
         return _openai_clients[endpoint]
 
     _llama_clients = {}
     def get_llama_client(feature):
         endpoint = config[feature]["endpoint"]
         if endpoint not in _llama_clients:
-            _llama_clients[endpoint] = LlamaStackClient(base_url=endpoint)
+            # LlamaStackClient adds /v1/ internally; strip it to avoid /v1/v1/ doubling
+            llama_base = endpoint.rstrip('/').removesuffix('/v1')
+            _llama_clients[endpoint] = LlamaStackClient(base_url=llama_base)
         return _llama_clients[endpoint]
 
     # Feature flags configuration from environment variables
