@@ -308,6 +308,11 @@
           "type": "boolean",
           "description": "Enable or disable A/B testing",
           "default": false
+        },
+        "mlflow_prompt_b_version": {
+          "type": "string",
+          "description": "MLflow prompt alias or version to use as the challenger (B) in A/B testing",
+          "examples": ["latest", "challenger", "2"]
         }
       },
       "additionalProperties": false
