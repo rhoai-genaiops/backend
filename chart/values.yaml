@@ -36,10 +36,7 @@ student-assistant:
 
 shields:
   enabled: false
-  endpoint: "http://llama-stack-service:8321"
-  input_shields: []
-  output_shields: []
-  check_interval: 50
+  endpoint: "http://canopy-guardrails/v1"
 
 feedback:
   enabled: false

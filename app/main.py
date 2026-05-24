@@ -1,3 +1,4 @@
+import requests as http_requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -17,6 +18,7 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 import random
+import re
 import mlflow
 
 app = FastAPI(title="Canopy Backend API")
@@ -113,13 +115,6 @@ if os.path.exists(config_path):
 
     # Shields configuration
     SHIELDS_CONFIG = {}
-    if FEATURE_FLAGS.get("shields", False):
-        SHIELDS_CONFIG = {
-            "input_shields": config["shields"].get("input_shields", []),
-            "output_shields": config["shields"].get("output_shields", []),
-            "model": config["shields"].get("model", config.get("student-assistant", {}).get("model", "llama32")),
-            "check_interval": config["shields"].get("check_interval", 50),
-        }
 else:
     # Fallback for testing - config will be loaded by tests
     config = None
@@ -506,55 +501,144 @@ async def summarization_chat(request: ChatRequest, raw_request: Request):
     q = queue.Queue()
 
     def worker_with_shields():
-        """Use Responses API when shields are enabled."""
-        print(f"sending chat request to model {model} with shields (Responses API)")
-        try:
-            input_shields = SHIELDS_CONFIG.get("input_shields", [])
-            output_shields = SHIELDS_CONFIG.get("output_shields", [])
-            guardrails = list(set(input_shields + output_shields))
+        """Call NeMo Guardrails with streaming and prevent known blocked output from leaking.
 
-            # Convert messages to the responses API format
-            input_messages = [{"role": msg["role"], "content": msg["content"], "type": "message"} for msg in messages]
+        This keeps streaming by holding back a small rolling buffer before forwarding
+        content to the frontend. The rolling buffer lets us detect blocked phrases
+        even when they are split across streamed chunks.
 
-            response = get_llama_client("shields").responses.create(
-                model=model,
-                instructions=sys_prompt,
-                input=input_messages,
-                temperature=temperature,
-                stream=True,
-                extra_body={"guardrails": guardrails} if guardrails else None,
+        Important:
+        - This protects regex-style output blocking while preserving streaming.
+        - For heavyweight output checks like HAP or PII, strict zero-leak blocking
+        still requires buffering or a detector that can run before release.
+        """
+        print(f"sending chat request to NeMo guardrails for model {model}")
+
+        REFUSAL_EMOJIS = {"🚫", "⚠️", "🌐", "🛡️", "😔", "🤔", "🔒"}
+
+        BLOCKED_OUTPUT_PATTERNS = [
+            r"\bfight\s+club\b",
+            r"\btyler\s+durden\b",
+            r"\bdurden\b",
+            r"\bproject\s+mayhem\b",
+            r"\bmarla\s+singer\b",
+            r"\bfirst\s+rule\s+of\b",
+        ]
+
+        blocked_output_regex = re.compile(
+            "|".join(f"(?:{pattern})" for pattern in BLOCKED_OUTPUT_PATTERNS),
+            flags=re.IGNORECASE,
+        )
+
+        # The backend streams with a small delay. This prevents blocked phrases from
+        # leaking before the regex can see them. Increase for stricter behavior,
+        # decrease for lower latency.
+        HOLD_BACK_CHARS = int(os.getenv("SHIELD_STREAM_HOLDBACK_CHARS", "256"))
+
+        SHIELD_VIOLATION_MESSAGE = (
+            "⚠️ I'm not able to provide information on that topic. "
+            "Let me know if there's something else I can help you with! 📚"
+        )
+
+        base_url = config["shields"]["endpoint"].rstrip("/")
+
+        if base_url.endswith("/chat/completions"):
+            nemo_url = base_url
+        elif base_url.endswith("/v1"):
+            nemo_url = f"{base_url}/chat/completions"
+        else:
+            nemo_url = f"{base_url}/v1/chat/completions"
+
+        full_messages = [{"role": "system", "content": sys_prompt}] + messages
+
+        payload = {
+            "model": model,
+            "messages": full_messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+        }
+
+        def send_delta(text: str):
+            if text:
+                q.put(f"data: {json.dumps({'delta': text})}\n\n")
+
+        def send_shield_violation(message: str):
+            q.put(
+                f"data: {json.dumps({'type': 'shield_violation', 'message': message})}\n\n"
             )
 
-            for event in response:
-                event_type = getattr(event, 'type', None)
-                print(f"[Responses API] Event type: {event_type}")
+        try:
+            pending = ""
+            blocked = False
 
-                if event_type == 'response.output_text.delta':
-                    delta_text = getattr(event, 'delta', '')
-                    if delta_text:
-                        chunk = f"data: {json.dumps({'delta': delta_text})}\n\n"
-                        q.put(chunk)
+            with http_requests.post(
+                nemo_url,
+                json=payload,
+                stream=True,
+                timeout=120,
+                headers={"Accept": "text/event-stream"},
+            ) as response:
+                response.raise_for_status()
 
-                elif event_type == 'response.failed':
-                    error_msg = 'Response generation failed'
-                    if hasattr(event, 'response') and hasattr(event.response, 'error'):
-                        error_msg = getattr(event.response.error, 'message', error_msg)
-                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
-                    q.put(chunk)
-                    break
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
 
-                elif event_type == 'response.completed':
-                    if hasattr(event, 'response'):
-                        resp = event.response
-                        if hasattr(resp, 'output') and resp.output:
-                            for output_msg in resp.output:
-                                if hasattr(output_msg, 'content') and output_msg.content:
-                                    for content_item in output_msg.content:
-                                        if isinstance(content_item, dict) and content_item.get('type') == 'refusal':
-                                            error_msg = "Your request was blocked by our safety guardrails"
-                                            chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
-                                            q.put(chunk)
-                                            return
+                    line = line.strip()
+
+                    if line == "data: [DONE]":
+                        break
+
+                    if not line.startswith("data: "):
+                        continue
+
+                    try:
+                        chunk_data = json.loads(line[len("data: "):])
+                    except json.JSONDecodeError:
+                        continue
+
+                    choices = chunk_data.get("choices", [])
+                    if not choices:
+                        continue
+
+                    choice = choices[0]
+
+                    delta = choice.get("delta") or {}
+                    content = delta.get("content")
+
+                    if content is None:
+                        message = choice.get("message") or {}
+                        content = message.get("content")
+
+                    if not content:
+                        continue
+
+                    pending += content
+
+                    # If NeMo sends a refusal at any point, do not stream it as normal text.
+                    # Treat it as a shield violation signal.
+                    if any(emoji in pending for emoji in REFUSAL_EMOJIS):
+                        blocked = True
+                        send_shield_violation(pending.strip())
+                        break
+
+                    # Local streaming regex guard. This catches blocked phrases before
+                    # they are released to the frontend.
+                    if blocked_output_regex.search(pending):
+                        blocked = True
+                        send_shield_violation(SHIELD_VIOLATION_MESSAGE)
+                        break
+
+                    # Stream everything except the hold-back tail.
+                    # The tail is kept so patterns split across chunks can still be detected.
+                    if len(pending) > HOLD_BACK_CHARS:
+                        safe_to_release = pending[:-HOLD_BACK_CHARS]
+                        pending = pending[-HOLD_BACK_CHARS:]
+                        send_delta(safe_to_release)
+
+            if not blocked and pending:
+                send_delta(pending)
 
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")

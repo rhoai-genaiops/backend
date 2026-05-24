@@ -146,35 +146,14 @@
     },
     "shields": {
       "type": "object",
-      "description": "Configuration for input/output moderation shields",
+      "description": "NeMo Guardrails configuration — when enabled, all requests go through the nemo-guardrail shield via Llama Stack Responses API",
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Enable or disable shields functionality",
+          "description": "Enable or disable NeMo Guardrails",
           "default": false
         },
-        "endpoint": { "$ref": "#/definitions/endpoint" },
-        "input_shields": {
-          "type": "array",
-          "description": "Shield names for input moderation",
-          "items": {
-            "type": "string"
-          },
-          "examples": [
-            ["hap", "language_detection", "prompt_injection"]
-          ]
-        },
-        "output_shields": {
-          "type": "array",
-          "description": "Shield names for output moderation",
-          "items": {
-            "type": "string"
-          }
-        },
-        "check_interval": {
-          "type": "number",
-          "description": "Interval for shield checks"
-        }
+        "endpoint": { "$ref": "#/definitions/endpoint" }
       },
       "additionalProperties": false
     },
