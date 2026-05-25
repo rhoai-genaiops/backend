@@ -23,7 +23,7 @@ spec:
       serviceAccountName: canopy-be
       containers:
         - name: canopy-backend
-          image: quay.io/rhoai-genaiops/canopy-be:0.25
+          image: quay.io/rhoai-genaiops/canopy-be:0.27
           ports:
             - containerPort: 8000
           env:
