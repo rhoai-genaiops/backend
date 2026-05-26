@@ -696,73 +696,76 @@ async def information_search(request: PromptRequest, raw_request: Request):
 
     q = queue.Queue()
 
-    print(f"Searching in collection {vector_db_id}")
-    print(f"Existing collections: {get_llama_client('information-search').vector_stores.list()}")
-    print(f"query: {request.prompt}")
+    mlflow.set_experiment("information-search")
 
-    search_results = get_llama_client("information-search").vector_stores.search(
-        vector_store_id=vector_db_id,
-        query=request.prompt,
-        max_num_results=5,
-        search_mode="vector"
-    )
-    retrieved_chunks = []
-    for i, result in enumerate(search_results.data):
-        chunk_content = result.content[0].text if hasattr(result, 'content') else str(result)
-        retrieved_chunks.append(chunk_content)
+    @mlflow.trace(span_type="RETRIEVER")
+    def retrieve_chunks(query: str) -> list[str]:
+        results = get_llama_client("information-search").vector_stores.search(
+            vector_store_id=vector_db_id,
+            query=query,
+            max_num_results=5,
+            search_mode="vector"
+        )
+        return [
+            result.content[0].text if hasattr(result, 'content') else str(result)
+            for result in results.data
+        ]
 
-    prompt_context = "\n\n".join(retrieved_chunks)
+    def worker(query: str, session_id: str):
+        with mlflow.start_span(name=query, span_type="CHAIN") as span:
+            span.set_inputs(query)
+            mlflow.update_current_trace(
+                metadata={
+                    "mlflow.trace.session": session_id,
+                    "vector_store_id": vector_db_id,
+                },
+            )
 
-    enhaned_prompt = f"""Please answer the given query using the document intelligence context below.
+            print(f"Searching in collection {vector_db_id}")
+            print(f"Existing collections: {get_llama_client('information-search').vector_stores.list()}")
+            print(f"query: {query}")
+
+            chunks = retrieve_chunks(query)
+            prompt_context = "\n\n".join(chunks)
+
+            enhanced_prompt = f"""Please answer the given query using the document intelligence context below.
 
     CONTEXT (Processed with Docling Document Intelligence):
     {prompt_context}
 
     QUERY:
-    {request.prompt}
+    {query}
 
     Note: The context includes intelligently processed content with preserved tables, formulas, figures, and document structure."""
 
-    mlflow.set_experiment("information-search")
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": enhanced_prompt},
+            ]
 
-    @mlflow.trace
-    def worker(messages: list[dict], query: str, chunks: list[str], vector_store: str, session_id: str):
-        mlflow.update_current_trace(
-            metadata={
-                "mlflow.trace.session": session_id,
-                "vector_store_id": vector_store,
-                "query": query,
-                "retrieved_chunks": chunks,
-                "num_chunks_retrieved": len(chunks),
-            },
-        )
-        full_response = ""
-        try:
-            response = get_openai_client("information-search").chat.completions.create(
-                model=config["information-search"]["model"],
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stream=True,
-            )
-            for r in response:
-                if hasattr(r, 'choices') and r.choices:
-                    delta = r.choices[0].delta
-                    if delta.content:
-                        full_response += delta.content
-                        chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
-                        q.put(chunk)
-        except Exception as e:
-            q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
-        finally:
-            q.put(None)
-        return full_response
+            full_response = ""
+            try:
+                response = get_openai_client("information-search").chat.completions.create(
+                    model=config["information-search"]["model"],
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stream=True,
+                )
+                for r in response:
+                    if hasattr(r, 'choices') and r.choices:
+                        delta = r.choices[0].delta
+                        if delta.content:
+                            full_response += delta.content
+                            chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
+                            q.put(chunk)
+            except Exception as e:
+                q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
+            finally:
+                q.put(None)
+            span.set_outputs({"response": full_response})
 
-    search_messages = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": enhaned_prompt},
-    ]
-    threading.Thread(target=worker, args=(search_messages, request.prompt, retrieved_chunks, vector_db_id, session_id)).start()
+    threading.Thread(target=worker, args=(request.prompt, session_id)).start()
 
     async def streamer():
         while True:
