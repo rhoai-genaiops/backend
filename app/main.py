@@ -713,7 +713,8 @@ async def information_search(request: PromptRequest, raw_request: Request):
 
     def worker(query: str, session_id: str):
         with mlflow.start_span(name=query, span_type="CHAIN") as span:
-            trace_id = mlflow.get_active_trace_id()
+            trace_id = getattr(span, 'request_id', None) or mlflow.get_active_trace_id()
+            print(f"[information-search] trace_id={trace_id}")
             span.set_inputs(query)
 
             print(f"Searching in collection {vector_db_id}")
@@ -792,69 +793,72 @@ async def student_assistant_chat(request: PromptRequest, raw_request: Request):
 
     mlflow.set_experiment("student-assistant")
 
-    @mlflow.trace(name="student-assistant", span_type="AGENT")
-    def run_agent(prompt: str) -> str:
-        thread_id = session_id or str(int(random.random() * 1000000))
-        config_params = {"configurable": {"thread_id": thread_id}}
-        inputs = {"messages": [{"role": "user", "content": prompt}]}
-
-        mlflow.update_current_trace(
-            metadata={"mlflow.trace.session": thread_id},
-        )
-
-        result = agent.invoke(inputs, config_params)
-        messages = result.get("messages", [])
-
-        # Send intermediate steps (tool calls and results) to frontend
-        for msg in messages:
-            msg_type = getattr(msg, "type", None)
-
-            if msg_type == "ai" and getattr(msg, "tool_calls", None):
-                for tc in msg.tool_calls:
-                    tool_call_data = {
-                        "type": "tool_call",
-                        "name": tc.get("name"),
-                        "args": tc.get("args")
-                    }
-                    chunk = f"data: {json.dumps(tool_call_data)}\n\n"
-                    q.put(chunk)
-
-            elif msg_type == "tool":
-                tool_result_data = {
-                    "type": "tool_result",
-                    "name": msg.name,
-                    "content": str(msg.content)
-                }
-                chunk = f"data: {json.dumps(tool_result_data)}\n\n"
-                q.put(chunk)
-
-        # Extract and send final answer
-        final_answer = ""
-        if messages:
-            for msg in reversed(messages):
-                if getattr(msg, "type", None) == "ai" and not getattr(msg, "tool_calls", None):
-                    content = msg.content
-                    if isinstance(content, list):
-                        text_parts = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                text_parts.append(part.get("text", ""))
-                        content = "".join(text_parts)
-
-                    if content:
-                        final_answer = content
-                        chunk = f"data: {json.dumps({'type': 'final_answer'})}\n\n"
-                        q.put(chunk)
-                        for char in content:
-                            chunk = f"data: {json.dumps({'delta': char})}\n\n"
-                            q.put(chunk)
-                    break
-
-        return final_answer
-
     def worker():
         try:
-            run_agent(request.prompt)
+            with mlflow.start_span(name=request.prompt, span_type="AGENT") as span:
+                trace_id = getattr(span, 'request_id', None) or mlflow.get_active_trace_id()
+                span.set_inputs(request.prompt)
+
+                thread_id = session_id or str(int(random.random() * 1000000))
+                config_params = {"configurable": {"thread_id": thread_id}}
+                inputs = {"messages": [{"role": "user", "content": request.prompt}]}
+
+                mlflow.update_current_trace(
+                    metadata={"mlflow.trace.session": thread_id},
+                )
+
+                result = agent.invoke(inputs, config_params)
+                messages = result.get("messages", [])
+
+                # Send intermediate steps (tool calls and results) to frontend
+                for msg in messages:
+                    msg_type = getattr(msg, "type", None)
+
+                    if msg_type == "ai" and getattr(msg, "tool_calls", None):
+                        for tc in msg.tool_calls:
+                            tool_call_data = {
+                                "type": "tool_call",
+                                "name": tc.get("name"),
+                                "args": tc.get("args")
+                            }
+                            chunk = f"data: {json.dumps(tool_call_data)}\n\n"
+                            q.put(chunk)
+
+                    elif msg_type == "tool":
+                        tool_result_data = {
+                            "type": "tool_result",
+                            "name": msg.name,
+                            "content": str(msg.content)
+                        }
+                        chunk = f"data: {json.dumps(tool_result_data)}\n\n"
+                        q.put(chunk)
+
+                # Extract and send final answer
+                final_answer = ""
+                if messages:
+                    for msg in reversed(messages):
+                        if getattr(msg, "type", None) == "ai" and not getattr(msg, "tool_calls", None):
+                            content = msg.content
+                            if isinstance(content, list):
+                                text_parts = []
+                                for part in content:
+                                    if isinstance(part, dict) and part.get("type") == "text":
+                                        text_parts.append(part.get("text", ""))
+                                content = "".join(text_parts)
+
+                            if content:
+                                final_answer = content
+                                chunk = f"data: {json.dumps({'type': 'final_answer'})}\n\n"
+                                q.put(chunk)
+                                for char in content:
+                                    chunk = f"data: {json.dumps({'delta': char})}\n\n"
+                                    q.put(chunk)
+                            break
+
+                span.set_outputs({"response": final_answer})
+
+                if trace_id:
+                    q.put(f"data: {json.dumps({'type': 'trace_id', 'trace_id': trace_id})}\n\n")
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
