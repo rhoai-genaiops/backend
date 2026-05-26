@@ -146,14 +146,20 @@
     },
     "shields": {
       "type": "object",
-      "description": "NeMo Guardrails configuration — when enabled, all requests go through the nemo-guardrail shield via Llama Stack Responses API",
+      "description": "NeMo Guardrails configuration — when enabled, all requests go through the NeMo Guardrails OpenAI-compatible endpoint",
       "properties": {
         "enabled": {
           "type": "boolean",
           "description": "Enable or disable NeMo Guardrails",
           "default": false
         },
-        "endpoint": { "$ref": "#/definitions/endpoint" }
+        "endpoint": { "$ref": "#/definitions/endpoint" },
+        "config": {
+          "type": "string",
+          "description": "NeMo Guardrails configuration name (maps to the config folder name in the NeMo server)",
+          "default": "canopy-guardrails",
+          "examples": ["canopy-guardrails"]
+        }
       },
       "additionalProperties": false
     },

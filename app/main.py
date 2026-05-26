@@ -55,6 +55,35 @@ mlflow.openai.autolog()
 mlflow.langchain.autolog()
 logging.getLogger("mlflow.langchain.langchain_tracer").setLevel(logging.ERROR)
 
+# =============================================================================
+# Refusal Signature Detection
+#
+# NeMo Guardrails returns the bot's refusal message as normal response content
+# when a rail blocks. Each bot message in rails.co starts with a unique emoji,
+# so we detect the guardrail by checking the first content chunk.
+#
+# Maps: emoji_prefix → (detector_name, frontend_css_class)
+# =============================================================================
+
+REFUSAL_SIGNATURES: dict[str, tuple[str, str | None]] = {
+    "🌐": ("language", "language"),
+    "🚫": ("hap_or_regex", "hap"),
+    "⚠️": ("regex", "regex"),
+    "🛡": ("prompt_injection", "prompt-injection"),  # 🛡️ starts with 🛡 (U+1F6E1)
+    "😔": ("hap", "hap"),
+    "🤔": ("topic_relevance", None),
+    "🔒": ("pii", None),
+}
+
+
+def _detect_refusal(content: str) -> tuple[str | None, str | None]:
+    """Return (detector_name, css_class) if content is a refusal, else (None, None)."""
+    stripped = content.lstrip()
+    for emoji, info in REFUSAL_SIGNATURES.items():
+        if stripped.startswith(emoji):
+            return info
+    return None, None
+
 
 def get_mlflow_prompt(feature, version_override=None):
     """Fetch system prompt from MLflow prompt registry for a given feature.
@@ -504,61 +533,49 @@ async def summarization_chat(request: ChatRequest, raw_request: Request):
 
     @mlflow.trace
     def worker_with_shields(messages: list[dict], user_message: str, session_id: str):
-        import httpx
         trace_id = mlflow.get_active_trace_id()
         if trace_id:
             trace_id_holder.append(trace_id)
         mlflow.update_current_trace(metadata={"mlflow.trace.session": session_id})
-        shield_id = config["shields"].get("shield_id", "nemo-guardrail")
+        shield_model = config["summarization"]["model"] 
+
+        first_content_seen = False
+        is_refusal = False
+        refusal_buffer = ""
         full_response = ""
+
         try:
-            # Derive the Llama Stack base URL from the configured endpoint
-            endpoint = config["summarization"]["endpoint"]
-            llama_base = endpoint.rstrip("/").removesuffix("/v1")
-
-            # Separate system prompt from user messages so the guardrail check
-            # only sees user content (not the system prompt). Llama Stack's
-            # /v1/responses accepts "instructions" for the system prompt and
-            # "input" for the conversation — vLLM gets both, NeMo only sees input.
-            user_messages = [m for m in messages if m.get("role") != "system"]
-            system_content = next((m["content"] for m in messages if m.get("role") == "system"), None)
-
-            req_body: dict = {
-                "model": model,
-                "input": user_messages,
-                "guardrails": [shield_id],
-            }
-            if system_content:
-                req_body["instructions"] = system_content
-
-            resp = httpx.post(
-                f"{llama_base}/v1/responses",
-                json=req_body,
-                timeout=120.0,
+            nemo_client = get_openai_client("shields")
+            stream = nemo_client.chat.completions.create(
+                model=shield_model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
             )
-            resp.raise_for_status()
-            response_data = resp.json()
+            for chunk in stream:
+                if not (hasattr(chunk, "choices") and chunk.choices):
+                    continue
+                content = chunk.choices[0].delta.content
+                if not content:
+                    continue
 
-            output_items = response_data.get("output", [])
-            output = output_items[0] if output_items else {}
-            content_items = output.get("content", [])
-            content = content_items[0] if content_items else {}
+                # Peek at the first chunk to detect a refusal emoji prefix.
+                if not first_content_seen:
+                    first_content_seen = True
+                    detector, css_class = _detect_refusal(content)
+                    is_refusal = detector is not None
 
-            _blocked_message = (
-                "🚫 I'm sorry, I'm not able to help with that request. "
-                "If you have an academic question or need help with your studies "
-                "at Redwood Digital University, I'm happy to assist! 🎓"
-            )
-            if (
-                content.get("type") == "refusal"
-                or response_data.get("safety_violation")
-                or "flagged for:" in content.get("text", "")
-            ):
-                full_response = _blocked_message
-            else:
-                full_response = content.get("text", "")
+                if is_refusal:
+                    refusal_buffer += content
+                else:
+                    full_response += content
+                    q.put(f"data: {json.dumps({'delta': content})}\n\n")
 
-            q.put(f"data: {json.dumps({'delta': full_response})}\n\n")
+            if is_refusal:
+                full_response = refusal_buffer.strip()
+                q.put(f"data: {json.dumps({'delta': full_response})}\n\n")
+
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         return full_response
