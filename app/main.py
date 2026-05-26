@@ -713,6 +713,7 @@ async def information_search(request: PromptRequest, raw_request: Request):
 
     def worker(query: str, session_id: str):
         with mlflow.start_span(name=query, span_type="CHAIN") as span:
+            trace_id = mlflow.get_active_trace_id()
             span.set_inputs(query)
 
             print(f"Searching in collection {vector_db_id}")
@@ -762,6 +763,8 @@ async def information_search(request: PromptRequest, raw_request: Request):
             except Exception as e:
                 q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
             finally:
+                if trace_id:
+                    q.put(f"data: {json.dumps({'type': 'trace_id', 'trace_id': trace_id})}\n\n")
                 q.put(None)
             span.set_outputs({"response": full_response})
 
