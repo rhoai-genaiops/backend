@@ -714,18 +714,18 @@ async def information_search(request: PromptRequest, raw_request: Request):
     def worker(query: str, session_id: str):
         with mlflow.start_span(name=query, span_type="CHAIN") as span:
             span.set_inputs(query)
-            mlflow.update_current_trace(
-                metadata={
-                    "mlflow.trace.session": session_id,
-                    "vector_store_id": vector_db_id,
-                },
-            )
 
             print(f"Searching in collection {vector_db_id}")
             print(f"Existing collections: {get_llama_client('information-search').vector_stores.list()}")
             print(f"query: {query}")
 
             chunks = retrieve_chunks(query)
+            span.set_attributes({
+                "mlflow.trace.session": session_id,
+                "vector_store_id": vector_db_id,
+                "retrieved_chunks": str(chunks),
+                "num_chunks_retrieved": str(len(chunks)),
+            })
             prompt_context = "\n\n".join(chunks)
 
             enhanced_prompt = f"""Please answer the given query using the document intelligence context below.
