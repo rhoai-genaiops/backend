@@ -549,7 +549,7 @@ async def summarization_chat(request: ChatRequest, raw_request: Request):
         if trace_id:
             trace_id_holder.append(trace_id)
         mlflow.update_current_trace(metadata={"mlflow.trace.session": session_id})
-        shield_model = config["summarization"]["model"] 
+        shield_model = config["shields"]["model"]
 
         first_content_seen = False
         is_refusal = False

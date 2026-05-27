@@ -37,6 +37,7 @@ student-assistant:
 shields:
   enabled: false
   endpoint: "http://canopy-guardrails/v1"
+  model: llama32
   config: canopy-guardrails
 
 feedback:

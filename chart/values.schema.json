@@ -159,6 +159,10 @@
           "description": "NeMo Guardrails configuration name (maps to the config folder name in the NeMo server)",
           "default": "canopy-guardrails",
           "examples": ["canopy-guardrails"]
+        },
+        "model": {
+          "type": "string",
+          "description": "Model name to use when routing requests through NeMo Guardrails"
         }
       },
       "additionalProperties": false
