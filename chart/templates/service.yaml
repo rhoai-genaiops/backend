@@ -3,9 +3,12 @@ apiVersion: v1
 kind: Service
 metadata:
   name: canopy-backend
+  labels:
+    app: canopy-backend
 spec:
   ports:
-    - port: 8000
+    - name: http
+      port: 8000
       targetPort: 8000
   selector:
     app: canopy-backend

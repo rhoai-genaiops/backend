@@ -13,4 +13,7 @@ openai>=1.0.0
 mlflow[kubernetes]>=2.15.0
 opentelemetry-sdk
 opentelemetry-exporter-otlp-proto-http
+opentelemetry-exporter-prometheus
+opentelemetry-instrumentation-fastapi
 opentelemetry-instrumentation-httpx
+prometheus-client

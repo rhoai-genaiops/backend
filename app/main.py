@@ -1,5 +1,11 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.exporter.prometheus import PrometheusMetricReader
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from prometheus_client import make_asgi_app
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from llama_stack_client import LlamaStackClient
@@ -20,6 +26,12 @@ import random
 import mlflow
 
 app = FastAPI(title="Canopy Backend API")
+
+_prometheus_reader = PrometheusMetricReader()
+metrics.set_meter_provider(MeterProvider(metric_readers=[_prometheus_reader]))
+FastAPIInstrumentor.instrument_app(app)
+HTTPXClientInstrumentor().instrument()
+app.mount("/metrics", make_asgi_app())
 
 # MLflow prompt registry configuration
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "https://mlflow.redhat-ods-applications.svc.cluster.local:8443")
