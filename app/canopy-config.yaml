@@ -1,0 +1,15 @@
+
+summarization:
+  enabled: true
+  endpoint: "http://llama-32-predictor.ai501.svc.cluster.local:80/v1"
+  model: llama32
+  temperature: 0.9
+  max_tokens: 4096
+  prompt: |
+    You are an assistant that summarizes the given content.
+  prompt_b: |
+    You are an assistant that summarizes the given content. Please provide a concise summary in emojis.
+feedback:
+  enabled: true
+# ab_testing:
+#   enabled: false

@@ -1,1 +1,47 @@
-LLAMA_STACK_URL: "http://llama-stack-service:8321"
+MLFLOW_TRACKING_URI: "https://mlflow.redhat-ods-applications.svc.cluster.local:8443"
+
+summarization:
+  enabled: true
+  endpoint: "http://llama-32-predictor:80/v1"
+  model: llama32
+  temperature: 0.9
+  max_tokens: 4096
+  mlflow_prompt: summarization
+
+socratic-tutor:
+  enabled: false
+  endpoint: "http://llama-32-predictor:80/v1"
+  model: llama32
+  temperature: 0.9
+  max_tokens: 1500
+  mlflow_prompt: socratic-tutor
+
+information-search:
+  enabled: false
+  endpoint: "http://llama-stack-service:8321/v1"
+  model: llama32
+  temperature: 0.7
+  max_tokens: 4096
+  vector_db_id: latest
+  mlflow_prompt: information-search
+
+student-assistant:
+  enabled: false
+  endpoint: "http://llama-stack-service:8321/v1"
+  model: llama32
+  temperature: 0.1
+  vector_db_id: latest
+  mcp_calendar_url: "http://canopy-mcp-calendar-mcp-server:8080/sse"
+  mlflow_prompt: student-assistant
+
+shields:
+  enabled: false
+  endpoint: "http://canopy-guardrails/v1"
+  model: llama32
+  config: canopy-guardrails
+
+feedback:
+  enabled: false
+
+ab_testing:
+  enabled: false

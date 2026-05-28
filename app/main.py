@@ -1,8 +1,16 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.exporter.prometheus import PrometheusMetricReader
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from prometheus_client import make_asgi_app
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from llama_stack_client import LlamaStackClient
+from openai import OpenAI
+from mlflow.entities import AssessmentSource, AssessmentSourceType
 import os
 import asyncio
 import json
@@ -10,14 +18,106 @@ import logging
 import threading
 import queue
 import yaml
-from datetime import datetime, timezone
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 import random
+import httpx
+import mlflow
 
 app = FastAPI(title="Canopy Backend API")
+
+_prometheus_reader = PrometheusMetricReader()
+metrics.set_meter_provider(MeterProvider(metric_readers=[_prometheus_reader]))
+FastAPIInstrumentor.instrument_app(app)
+HTTPXClientInstrumentor().instrument()
+app.mount("/metrics", make_asgi_app())
+
+# MLflow prompt registry configuration
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "https://mlflow.redhat-ods-applications.svc.cluster.local:8443")
+if not os.getenv("MLFLOW_TRACKING_AUTH"):
+    os.environ["MLFLOW_TRACKING_AUTH"] = "kubernetes"
+if not os.getenv("MLFLOW_TRACKING_INSECURE_TLS"):
+    os.environ["MLFLOW_TRACKING_INSECURE_TLS"] = "true"
+
+NAMESPACE_PATH = "/run/secrets/kubernetes.io/serviceaccount/namespace"
+APP_NAMESPACE = os.getenv("MLFLOW_WORKSPACE")
+TOOLINGS_NAMESPACE = os.getenv("MLFLOW_PROMPT_WORKSPACE")
+
+if not APP_NAMESPACE and os.path.exists(NAMESPACE_PATH):
+    with open(NAMESPACE_PATH) as f:
+        APP_NAMESPACE = f.read().strip()
+
+if APP_NAMESPACE:
+    os.environ["MLFLOW_WORKSPACE"] = APP_NAMESPACE
+    if not TOOLINGS_NAMESPACE:
+        if APP_NAMESPACE.endswith(("-test", "-prod")):
+            user_prefix = APP_NAMESPACE.rsplit("-", 1)[0]
+            TOOLINGS_NAMESPACE = f"{user_prefix}-toolings"
+        else:
+            TOOLINGS_NAMESPACE = APP_NAMESPACE
+
+SA_TOKEN_PATH = "/run/secrets/kubernetes.io/serviceaccount/token"
+if os.path.exists(SA_TOKEN_PATH):
+    with open(SA_TOKEN_PATH) as f:
+        os.environ["MLFLOW_TRACKING_TOKEN"] = f.read().strip()
+
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+mlflow.openai.autolog()
+mlflow.langchain.autolog()
+logging.getLogger("mlflow.langchain.langchain_tracer").setLevel(logging.ERROR)
+
+# =============================================================================
+# Refusal Signature Detection
+#
+# NeMo Guardrails returns the bot's refusal message as normal response content
+# when a rail blocks. Each bot message in rails.co starts with a unique emoji,
+# so we detect the guardrail by checking the first content chunk.
+#
+# Maps: emoji_prefix → (detector_name, frontend_css_class)
+# =============================================================================
+
+REFUSAL_SIGNATURES: dict[str, tuple[str, str | None]] = {
+    "🌐": ("language", "language"),
+    "🚫": ("hap_or_regex", "hap"),
+    "⚠️": ("regex", "regex"),
+    "🛡": ("prompt_injection", "prompt-injection"),  # 🛡️ starts with 🛡 (U+1F6E1)
+    "😔": ("hap", "hap"),
+    "🤔": ("topic_relevance", None),
+    "🔒": ("pii", None),
+}
+
+
+def _detect_refusal(content: str) -> tuple[str | None, str | None]:
+    """Return (detector_name, css_class) if content is a refusal, else (None, None)."""
+    stripped = content.lstrip()
+    for emoji, info in REFUSAL_SIGNATURES.items():
+        if stripped.startswith(emoji):
+            return info
+    return None, None
+
+
+def get_mlflow_prompt(feature, version_override=None):
+    """Fetch system prompt from MLflow prompt registry for a given feature.
+
+    Temporarily switches to the toolings workspace to load prompts,
+    then switches back to the app's own workspace for experiment tracking.
+    """
+    prompt_name = config[feature]["mlflow_prompt"]
+    version = version_override or config[feature].get("mlflow_prompt_version", "latest")
+    original_workspace = os.environ.get("MLFLOW_WORKSPACE")
+    try:
+        if TOOLINGS_NAMESPACE:
+            os.environ["MLFLOW_WORKSPACE"] = TOOLINGS_NAMESPACE
+        if version.isdigit():
+            prompt = mlflow.genai.load_prompt(f"prompts:/{prompt_name}/{version}")
+        else:
+            prompt = mlflow.genai.load_prompt(f"prompts:/{prompt_name}@{version}")
+    finally:
+        if original_workspace:
+            os.environ["MLFLOW_WORKSPACE"] = original_workspace
+    return prompt.template
 
 # Load configuration with fallback for testing
 config_path = os.getenv("CANOPY_CONFIG_PATH", "/canopy/canopy-config.yaml")
@@ -25,12 +125,27 @@ if os.path.exists(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    llama_client = LlamaStackClient(base_url=config["LLAMA_STACK_URL"])
+    _openai_clients = {}
+    def get_openai_client(feature):
+        endpoint = config[feature]["endpoint"]
+        if endpoint not in _openai_clients:
+            base_url = endpoint if endpoint.endswith('/') else endpoint + '/'
+            _openai_clients[endpoint] = OpenAI(base_url=base_url, api_key="no-key-required")
+        return _openai_clients[endpoint]
+
+    _llama_clients = {}
+    def get_llama_client(feature):
+        endpoint = config[feature]["endpoint"]
+        if endpoint not in _llama_clients:
+            # LlamaStackClient adds /v1/ internally; strip it to avoid /v1/v1/ doubling
+            llama_base = endpoint.rstrip('/').removesuffix('/v1')
+            _llama_clients[endpoint] = LlamaStackClient(base_url=llama_base)
+        return _llama_clients[endpoint]
 
     # Feature flags configuration from environment variables
     FEATURE_FLAGS = {
         "information-search": "information-search" in config and config["information-search"]["enabled"] == True,
-        "summarize": "summarize" in config and config["summarize"]["enabled"] == True,
+        "summarization": "summarization" in config and config["summarization"]["enabled"] == True,
         "student-assistant": "student-assistant" in config and config["student-assistant"]["enabled"] == True,
         "shields": "shields" in config and config["shields"]["enabled"] == True,
         "feedback": "feedback" in config and config["feedback"]["enabled"] == True,
@@ -40,20 +155,14 @@ if os.path.exists(config_path):
 
     # Shields configuration
     SHIELDS_CONFIG = {}
-    if FEATURE_FLAGS.get("shields", False):
-        SHIELDS_CONFIG = {
-            "input_shields": config["shields"].get("input_shields", []),
-            "output_shields": config["shields"].get("output_shields", []),
-            "model": config["shields"].get("model", config.get("student-assistant", {}).get("model", "llama32")),
-            "check_interval": config["shields"].get("check_interval", 50),
-        }
 else:
     # Fallback for testing - config will be loaded by tests
     config = None
-    llama_client = None
+    def get_openai_client(feature): return None
+    def get_llama_client(feature): return None
     FEATURE_FLAGS = {
         "information-search": False,
-        "summarize": False,
+        "summarization": False,
         "student-assistant": False,
         "shields": False,
         "feedback": False,
@@ -152,7 +261,7 @@ if FEATURE_FLAGS.get("student-assistant", False):
     vector_store_id = config["student-assistant"].get("vector_db_id", "latest")
 
     # Create tools using factory function
-    student_tools = create_student_tools(llama_client, vector_store_id)
+    student_tools = create_student_tools(get_llama_client("student-assistant"), vector_store_id)
 
     tools = student_tools + [
         {
@@ -164,7 +273,7 @@ if FEATURE_FLAGS.get("student-assistant", False):
     ]
 
     llm = ChatOpenAI(
-        openai_api_base=config["LLAMA_STACK_URL"] + "/v1",
+        openai_api_base=config["student-assistant"]["endpoint"],
         model=config["student-assistant"]["model"],
         openai_api_key="not-needed",
         use_responses_api=True,
@@ -172,7 +281,7 @@ if FEATURE_FLAGS.get("student-assistant", False):
     )
 
     # Evaluate the prompt as an f-string to execute any Python expressions in {}
-    prompt_template = config["student-assistant"].get("prompt", "You are a helpful university assistant.")
+    prompt_template = get_mlflow_prompt("student-assistant")
     formatted_prompt = eval(f'f"""{prompt_template}"""')
 
     agent = create_react_agent(
@@ -181,20 +290,6 @@ if FEATURE_FLAGS.get("student-assistant", False):
         prompt=formatted_prompt,
         checkpointer=MemorySaver()
     )
-
-# Structured logger for feedback events (collected by LokiStack via STDOUT)
-feedback_logger = logging.getLogger("canopy.feedback")
-feedback_logger.setLevel(logging.INFO)
-feedback_logger.propagate = False  # Prevent duplicate output from root logger
-_feedback_handler = logging.StreamHandler()
-_feedback_handler.setFormatter(logging.Formatter('%(message)s'))
-feedback_logger.addHandler(_feedback_handler)
-
-# In-memory feedback store (data lost on restart - acceptable for enablement)
-feedback_store: List[Dict[str, Any]] = []
-
-# In-memory A/B feedback store (separate from regular feedback)
-ab_feedback_store: List[Dict[str, Any]] = []
 
 class PromptRequest(BaseModel):
     prompt: str
@@ -208,19 +303,17 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
 
 class FeedbackRequest(BaseModel):
-    input_text: str
-    response_text: str
+    trace_id: str
     rating: str  # "thumbs_up" or "thumbs_down"
-    feature: str = "summarize"
+    feature: str = "summarization"
     comment: Optional[str] = None
 
 class ABFeedbackRequest(BaseModel):
-    input_text: str
-    response_a: str
-    response_b: str
+    trace_id_a: str
+    trace_id_b: str
     preference: str  # "a" or "b"
     prompt_mapping: Dict[str, str]  # {"a": "prompt", "b": "prompt_b"}
-    feature: str = "summarize"
+    feature: str = "summarization"
 
 @app.get("/feature-flags")
 async def get_feature_flags() -> Dict[str, Any]:
@@ -229,132 +322,69 @@ async def get_feature_flags() -> Dict[str, Any]:
 
 @app.post("/feedback")
 async def submit_feedback(request: FeedbackRequest):
-    """Submit thumbs up/down feedback on an AI response."""
+    """Attach thumbs up/down feedback to the MLflow trace for this response."""
     if not FEATURE_FLAGS.get("feedback", False):
         raise HTTPException(status_code=404, detail="Feedback feature is not enabled")
 
-    feedback_entry = {
-        "id": len(feedback_store) + 1,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "feature": request.feature,
-        "rating": request.rating,
-        "input_text": request.input_text,
-        "response_text": request.response_text,
-        "comment": request.comment,
-    }
-
-    feedback_store.append(feedback_entry)
-
-    # Structured log for LokiStack (JSON on STDOUT is auto-collected)
-    feedback_logger.info(json.dumps({
-        "event": "feedback_submitted",
-        "feedback_id": feedback_entry["id"],
-        "feature": request.feature,
-        "rating": request.rating,
-        "input_length": len(request.input_text),
-        "response_length": len(request.response_text),
-        "timestamp": feedback_entry["timestamp"],
-    }))
-
-    return {"status": "ok", "feedback_id": feedback_entry["id"]}
+    for attempt in range(8):
+        try:
+            mlflow.log_feedback(
+                trace_id=request.trace_id,
+                name="user_satisfaction",
+                value=(request.rating == "thumbs_up"),
+                rationale=request.comment,
+                source=AssessmentSource(
+                    source_type=AssessmentSourceType.HUMAN,
+                    source_id="canopy_user",
+                ),
+            )
+            return {"status": "ok"}
+        except Exception as e:
+            if "RESOURCE_DOES_NOT_EXIST" in str(e) and attempt < 7:
+                await asyncio.sleep(1)
+            else:
+                raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/feedback")
-async def list_feedback():
-    """List all collected feedback entries."""
-    if not FEATURE_FLAGS.get("feedback", False):
-        raise HTTPException(status_code=404, detail="Feedback feature is not enabled")
-
-    return {
-        "total": len(feedback_store),
-        "feedback": feedback_store,
-    }
-
-
-@app.get("/feedback/export")
-async def export_feedback_for_eval():
-    """Export negative feedback as eval-compatible dataset.
-
-    Format matches canopy-evals summary_tests.yaml structure.
-    """
-    if not FEATURE_FLAGS.get("feedback", False):
-        raise HTTPException(status_code=404, detail="Feedback feature is not enabled")
-
-    negative_feedback = [
-        entry for entry in feedback_store if entry["rating"] == "thumbs_down"
-    ]
-
-    tests = []
-    for entry in negative_feedback:
-        tests.append({
-            "prompt": entry["input_text"],
-            "expected_result": "",  # To be filled by human reviewer
-        })
-
-    eval_dataset = {
-        "name": "feedback_eval_tests",
-        "description": "Tests generated from negative user feedback on summarization.",
-        "endpoint": "/summarize",
-        "scoring_params": {
-            "llm-as-judge::base": {
-                "judge_model": "llama32",
-                "prompt_template": "judge_prompt.txt",
-                "type": "llm_as_judge",
-                "judge_score_regexes": ["Answer: (A|B|C|D|E)"],
-            },
-            "basic::subset_of": None,
-        },
-        "tests": tests,
-    }
-
-    yaml_output = yaml.dump(eval_dataset, default_flow_style=False, allow_unicode=True, sort_keys=False)
-
-    feedback_logger.info(json.dumps({
-        "event": "feedback_exported",
-        "total_negative": len(negative_feedback),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }))
-
-    return Response(
-        content=yaml_output,
-        media_type="application/x-yaml",
-        headers={"Content-Disposition": "attachment; filename=feedback-eval-dataset.yaml"},
-    )
-
-
-@app.post("/summarize/ab")
-async def summarize_ab(request: PromptRequest):
+@app.post("/summarization/ab")
+async def summarization_ab(request: PromptRequest, raw_request: Request):
     """Run the same input through two different prompts for A/B comparison."""
-    if not FEATURE_FLAGS.get("summarize", False):
+    if not FEATURE_FLAGS.get("summarization", False):
         raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
     if not FEATURE_FLAGS.get("ab_testing", False):
         raise HTTPException(status_code=404, detail="A/B testing feature is not enabled")
 
-    prompt_a_text = config["summarize"].get("prompt", "Summarize the following text:")
-    prompt_b_text = config["summarize"].get("prompt_b")
-    if not prompt_b_text:
-        raise HTTPException(status_code=400, detail="prompt_b is not configured in summarize config")
+    session_id = raw_request.headers.get("x-session-id")
+    prompt_b_version = config.get("ab_testing", {}).get("mlflow_prompt_b_version", "latest")
+    prompt_a_text = get_mlflow_prompt("summarization")
+    prompt_b_text = get_mlflow_prompt("summarization", version_override=prompt_b_version)
 
-    temperature = config["summarize"].get("temperature", 0.7)
-    max_tokens = config["summarize"].get("max_tokens", 4096)
-    model = config["summarize"]["model"]
+    temperature = config["summarization"].get("temperature", 0.7)
+    max_tokens = config["summarization"].get("max_tokens", 4096)
+    model = config["summarization"]["model"]
 
     # Randomize which prompt is A vs B to avoid position bias
-    prompts = [("prompt", prompt_a_text), ("prompt_b", prompt_b_text)]
+    prompts = [("champion", prompt_a_text), ("challenger", prompt_b_text)]
     random.shuffle(prompts)
     mapping = {"a": prompts[0][0], "b": prompts[1][0]}
 
     q = queue.Queue()
 
+    mlflow.set_experiment("summarization")
+
     def ab_worker(variant, sys_prompt):
-        """Run inference for one variant and tag chunks."""
-        try:
-            response = llama_client.chat.completions.create(
+        """Run inference for one variant, tag chunks, and emit trace_id after flush."""
+        ab_trace_id_holder = []
+
+        @mlflow.trace(name=f"summarization_ab_{variant}")
+        def run(messages: list) -> str:
+            trace_id = mlflow.get_active_trace_id()
+            if trace_id:
+                ab_trace_id_holder.append(trace_id)
+            full_response = ""
+            response = get_openai_client("summarization").chat.completions.create(
                 model=model,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": request.prompt},
-                ],
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
@@ -363,8 +393,19 @@ async def summarize_ab(request: PromptRequest):
                 if hasattr(r, 'choices') and r.choices:
                     delta = r.choices[0].delta
                     if delta.content:
+                        full_response += delta.content
                         chunk = f"data: {json.dumps({'variant': variant, 'delta': delta.content})}\n\n"
                         q.put(chunk)
+            return full_response
+
+        ab_messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": request.prompt},
+        ]
+        try:
+            run(ab_messages)
+            if ab_trace_id_holder:
+                q.put(f"data: {json.dumps({'type': f'trace_id_{variant}', 'trace_id': ab_trace_id_holder[0]})}\n\n")
         except Exception as e:
             q.put(f"data: {json.dumps({'variant': variant, 'error': str(e)})}\n\n")
         finally:
@@ -391,183 +432,87 @@ async def summarize_ab(request: PromptRequest):
 
 @app.post("/feedback/ab")
 async def submit_ab_feedback(request: ABFeedbackRequest):
-    """Submit A/B comparison feedback."""
+    """Attach A/B preference as feedback on both MLflow traces."""
     if not FEATURE_FLAGS.get("feedback", False):
         raise HTTPException(status_code=404, detail="Feedback feature is not enabled")
     if not FEATURE_FLAGS.get("ab_testing", False):
         raise HTTPException(status_code=404, detail="A/B testing feature is not enabled")
 
-    # Resolve which actual prompt won
-    winning_prompt = None
-    if request.preference in ("a", "b"):
-        winning_prompt = request.prompt_mapping.get(request.preference)
+    winning_prompt = request.prompt_mapping.get(request.preference, "unknown")
+    winning_trace_id = request.trace_id_a if request.preference == "a" else request.trace_id_b
+    losing_trace_id = request.trace_id_b if request.preference == "a" else request.trace_id_a
 
-    ab_entry = {
-        "id": len(ab_feedback_store) + 1,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "feature": request.feature,
-        "preference": request.preference,
-        "winning_prompt": winning_prompt,
-        "prompt_mapping": request.prompt_mapping,
-        "input_text": request.input_text,
-        "response_a": request.response_a,
-        "response_b": request.response_b,
-    }
-
-    ab_feedback_store.append(ab_entry)
-
-    feedback_logger.info(json.dumps({
-        "event": "ab_feedback_submitted",
-        "feedback_id": ab_entry["id"],
-        "feature": request.feature,
-        "preference": request.preference,
-        "winning_prompt": winning_prompt,
-        "prompt_mapping": request.prompt_mapping,
-        "timestamp": ab_entry["timestamp"],
-    }))
-
-    return {"status": "ok", "feedback_id": ab_entry["id"]}
+    for attempt in range(8):
+        try:
+            mlflow.log_feedback(
+                trace_id=winning_trace_id,
+                name="ab_preference",
+                value=True,
+                rationale=f"User preferred this response (mapped to {winning_prompt})",
+                source=AssessmentSource(source_type=AssessmentSourceType.HUMAN, source_id="canopy_user"),
+            )
+            mlflow.log_feedback(
+                trace_id=losing_trace_id,
+                name="ab_preference",
+                value=False,
+                rationale=f"User preferred the alternative response (mapped to {winning_prompt})",
+                source=AssessmentSource(source_type=AssessmentSourceType.HUMAN, source_id="canopy_user"),
+            )
+            return {"status": "ok"}
+        except Exception as e:
+            if "RESOURCE_DOES_NOT_EXIST" in str(e) and attempt < 7:
+                await asyncio.sleep(1)
+            else:
+                raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/feedback/ab")
-async def list_ab_feedback():
-    """List all A/B feedback entries with win-rate stats."""
-    if not FEATURE_FLAGS.get("feedback", False):
-        raise HTTPException(status_code=404, detail="Feedback feature is not enabled")
-    if not FEATURE_FLAGS.get("ab_testing", False):
-        raise HTTPException(status_code=404, detail="A/B testing feature is not enabled")
-
-    prompt_a_wins = sum(1 for e in ab_feedback_store if e["winning_prompt"] == "prompt")
-    prompt_b_wins = sum(1 for e in ab_feedback_store if e["winning_prompt"] == "prompt_b")
-    ties = sum(1 for e in ab_feedback_store if e["preference"] == "tie")
-
-    return {
-        "total": len(ab_feedback_store),
-        "prompt_a_wins": prompt_a_wins,
-        "prompt_b_wins": prompt_b_wins,
-        "ties": ties,
-        "entries": ab_feedback_store,
-    }
-
-
-@app.post("/summarize")
-async def summarize(request: PromptRequest):
-    # Check if summarization feature is enabled
-    if not FEATURE_FLAGS.get("summarize", False):
+@app.post("/summarization")
+async def summarization(request: PromptRequest, raw_request: Request):
+    if not FEATURE_FLAGS.get("summarization", False):
         raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
 
-    sys_prompt = config["summarize"].get("prompt", "Summarize the following text:")
-    temperature = config["summarize"].get("temperature", 0.7)
-    max_tokens = config["summarize"].get("max_tokens", 4096)
-    model = config["summarize"]["model"]
+    sys_prompt = get_mlflow_prompt("summarization")
+    temperature = config["summarization"].get("temperature", 0.7)
+    max_tokens = config["summarization"].get("max_tokens", 4096)
+    model = config["summarization"]["model"]
+    session_id = raw_request.headers.get("x-session-id")
 
     q = queue.Queue()
 
-    def worker_with_shields():
-        """Use Responses API when shields are enabled - guardrails handled server-side."""
-        print(f"sending request to model {model} with shields (Responses API)")
+    mlflow.set_experiment("summarization")
+
+    @mlflow.trace
+    def worker(messages: list[dict], session_id: str):
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": session_id},
+        )
+        print(f"sending request to model {model} (direct model endpoint)")
+        full_response = ""
         try:
-            input_shields = SHIELDS_CONFIG.get("input_shields", [])
-            output_shields = SHIELDS_CONFIG.get("output_shields", [])
-            # Combine input and output shields for guardrails
-            guardrails = list(set(input_shields + output_shields))
-
-            # Use Responses API with guardrails
-            response = llama_client.responses.create(
+            response = get_openai_client("summarization").chat.completions.create(
                 model=model,
-                instructions=sys_prompt,
-                input=[{"role": "user", "content": request.prompt, "type": "message"}],
-                temperature=temperature,
-                stream=True,
-                extra_body={"guardrails": guardrails} if guardrails else None,
-            )
-
-            for event in response:
-                # Handle different event types
-                event_type = getattr(event, 'type', None)
-                print(f"[Responses API] Event type: {event_type}")
-                print(f"[Responses API] Event: {event}")
-
-                # Handle text delta streaming
-                if event_type == 'response.output_text.delta':
-                    delta_text = getattr(event, 'delta', '')
-                    if delta_text:
-                        print(f"[Responses API] Delta: {delta_text}")
-                        chunk = f"data: {json.dumps({'delta': delta_text})}\n\n"
-                        q.put(chunk)
-
-                # Handle response failure (includes guardrail violations)
-                elif event_type == 'response.failed':
-                    error_msg = 'Response generation failed'
-                    if hasattr(event, 'response') and hasattr(event.response, 'error'):
-                        error_msg = getattr(event.response.error, 'message', error_msg)
-                    print(f"[Responses API] Failed: {error_msg}")
-                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
-                    q.put(chunk)
-                    break
-
-                # Handle completed response
-                elif event_type == 'response.completed':
-                    print(f"[Responses API] Completed")
-                    if hasattr(event, 'response'):
-                        resp = event.response
-                        # Check for refusal in output (guardrail violation)
-                        if hasattr(resp, 'output') and resp.output:
-                            for output_msg in resp.output:
-                                if hasattr(output_msg, 'content') and output_msg.content:
-                                    for content_item in output_msg.content:
-                                        if isinstance(content_item, dict) and content_item.get('type') == 'refusal':
-                                            error_msg = "Your request was blocked by our safety guardrails"
-                                            print(f"[Responses API] Guardrail refusal detected")
-                                            chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
-                                            q.put(chunk)
-                                            return
-                        # Check if response has error status
-                        if hasattr(resp, 'status') and resp.status == 'failed':
-                            error_msg = 'Content blocked by safety guardrails'
-                            if hasattr(resp, 'error') and resp.error:
-                                error_msg = getattr(resp.error, 'message', error_msg)
-                            print(f"[Responses API] Guardrail violation: {error_msg}")
-                            chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
-                            q.put(chunk)
-
-        except Exception as e:
-            q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
-        finally:
-            q.put(None)
-
-    def worker_without_shields():
-        """Use direct inference API when shields are disabled."""
-        print(f"sending request to model {model} without shields (Inference API)")
-        try:
-            response = llama_client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": request.prompt},
-                ],
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
             )
-
-            for r in response:
-                if hasattr(r, 'choices') and r.choices:
-                    delta = r.choices[0].delta
+            for chunk in response:
+                if hasattr(chunk, 'choices') and chunk.choices:
+                    delta = chunk.choices[0].delta
                     if delta.content:
-                        chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
-                        q.put(chunk)
-
+                        full_response += delta.content
+                        q.put(f"data: {json.dumps({'delta': delta.content})}\n\n")
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
             q.put(None)
+        return full_response
 
-    # Choose worker based on shields feature flag
-    if FEATURE_FLAGS.get("shields", False):
-        threading.Thread(target=worker_with_shields).start()
-    else:
-        threading.Thread(target=worker_without_shields).start()
+    summarize_messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": request.prompt},
+    ]
+    threading.Thread(target=worker, args=(summarize_messages, session_id)).start()
 
     async def streamer():
         while True:
@@ -578,110 +523,134 @@ async def summarize(request: PromptRequest):
 
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
-@app.post("/summarize/chat")
-async def summarize_chat(request: ChatRequest):
+@app.post("/summarization/chat")
+async def summarization_chat(request: ChatRequest, raw_request: Request):
     """Chat endpoint for summarization with conversation history."""
-    if not FEATURE_FLAGS.get("summarize", False):
+    if not FEATURE_FLAGS.get("summarization", False):
         raise HTTPException(status_code=404, detail="Summarization feature is not enabled")
 
-    sys_prompt = config["summarize"].get("prompt", "Summarize the following text:")
-    temperature = config["summarize"].get("temperature", 0.7)
-    max_tokens = config["summarize"].get("max_tokens", 4096)
-    model = config["summarize"]["model"]
+    sys_prompt = get_mlflow_prompt("summarization")
+    temperature = config["summarization"].get("temperature", 0.7)
+    max_tokens = config["summarization"].get("max_tokens", 4096)
+    model = config["summarization"]["model"]
+    session_id = raw_request.headers.get("x-session-id") or request.session_id
 
     # Convert ChatMessage objects to dict format for the LLM
     messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
 
     q = queue.Queue()
 
-    def worker_with_shields():
-        """Use Responses API when shields are enabled."""
-        print(f"sending chat request to model {model} with shields (Responses API)")
+    shields_full_messages = [{"role": "system", "content": sys_prompt}] + messages
+    trace_id_holder = []
+
+    @mlflow.trace
+    def worker_with_shields(messages: list[dict], session_id: str):
+        trace_id = mlflow.get_active_trace_id()
+        if trace_id:
+            trace_id_holder.append(trace_id)
+        mlflow.update_current_trace(metadata={"mlflow.trace.session": session_id})
+
+        nemo_endpoint = config["shields"]["endpoint"].rstrip("/")
+        guardrail_config = config["shields"]["config"]
+        full_response = ""
+
         try:
-            input_shields = SHIELDS_CONFIG.get("input_shields", [])
-            output_shields = SHIELDS_CONFIG.get("output_shields", [])
-            guardrails = list(set(input_shields + output_shields))
-
-            # Convert messages to the responses API format
-            input_messages = [{"role": msg["role"], "content": msg["content"], "type": "message"} for msg in messages]
-
-            response = llama_client.responses.create(
-                model=model,
-                instructions=sys_prompt,
-                input=input_messages,
-                temperature=temperature,
-                stream=True,
-                extra_body={"guardrails": guardrails} if guardrails else None,
+            check_resp = httpx.post(
+                f"{nemo_endpoint}/guardrail/checks",
+                json={"model": config["shields"]["model"], "messages": messages},
+                timeout=30.0,
             )
-
-            for event in response:
-                event_type = getattr(event, 'type', None)
-                print(f"[Responses API] Event type: {event_type}")
-
-                if event_type == 'response.output_text.delta':
-                    delta_text = getattr(event, 'delta', '')
-                    if delta_text:
-                        chunk = f"data: {json.dumps({'delta': delta_text})}\n\n"
-                        q.put(chunk)
-
-                elif event_type == 'response.failed':
-                    error_msg = 'Response generation failed'
-                    if hasattr(event, 'response') and hasattr(event.response, 'error'):
-                        error_msg = getattr(event.response.error, 'message', error_msg)
-                    chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
-                    q.put(chunk)
-                    break
-
-                elif event_type == 'response.completed':
-                    if hasattr(event, 'response'):
-                        resp = event.response
-                        if hasattr(resp, 'output') and resp.output:
-                            for output_msg in resp.output:
-                                if hasattr(output_msg, 'content') and output_msg.content:
-                                    for content_item in output_msg.content:
-                                        if isinstance(content_item, dict) and content_item.get('type') == 'refusal':
-                                            error_msg = "Your request was blocked by our safety guardrails"
-                                            chunk = f"data: {json.dumps({'type': 'shield_violation', 'message': error_msg})}\n\n"
-                                            q.put(chunk)
-                                            return
-
+            check_resp.raise_for_status()
+            result = check_resp.json()
         except Exception as e:
-            q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
-        finally:
-            q.put(None)
+            q.put(f"data: {json.dumps({'error': f'Guardrail check failed: {str(e)}'})}\n\n")
+            return full_response
 
-    def worker_without_shields():
-        """Use direct inference API when shields are disabled."""
-        print(f"sending chat request to model {model} without shields (Inference API)")
+        if result.get("status") == "blocked":
+            activated = result.get("guardrails_data", {}).get("log", {}).get("activated_rails", [])
+            rail_name = activated[0] if activated else ""
+            _RAIL_MESSAGES = {
+                "check language": "🌐 Please use English only. I can only respond to questions in English.",
+                "regex check input": "🚫 I'm sorry, that topic is outside the scope of what I can help with. If you have an academic question or need help with your studies at Redwood Digital University, I'm happy to assist! 🎓",
+                "regex check output": "⚠️ I'm not able to provide information on that topic. Let me know if there's something else I can help you with! 📚",
+                "detect sensitive data on input": "🔒 Sensitive personal information detected. For your privacy, I cannot process messages containing personal data.",
+                "detect sensitive data on output": "🔒 Sensitive personal information detected. For your privacy, I cannot process messages containing personal data.",
+                "hf classifier check input": "🚫 Inappropriate content detected. Please keep your messages respectful and professional.",
+                "hf classifier check output": "😔 I cannot provide that response as it may contain inappropriate content. Please rephrase your question.",
+                "self check input": "🤔 I'm sorry, I'm not able to help with that request. If you have an academic question or need help with your studies at Redwood Digital University, I'm happy to assist! 🎓",
+            }
+            refusal = _RAIL_MESSAGES.get(rail_name, "🤔 I'm sorry, I'm not able to help with that request.")
+            q.put(f"data: {json.dumps({'delta': refusal})}\n\n")
+            return refusal
+
         try:
-            # Prepend system message
-            full_messages = [{"role": "system", "content": sys_prompt}] + messages
-
-            response = llama_client.chat.completions.create(
+            response = get_openai_client("summarization").chat.completions.create(
                 model=model,
-                messages=full_messages,
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
             )
-
-            for r in response:
-                if hasattr(r, 'choices') and r.choices:
-                    delta = r.choices[0].delta
+            for chunk in response:
+                if hasattr(chunk, "choices") and chunk.choices:
+                    delta = chunk.choices[0].delta
                     if delta.content:
-                        chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
-                        q.put(chunk)
-
+                        full_response += delta.content
+                        q.put(f"data: {json.dumps({'delta': delta.content})}\n\n")
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
-        finally:
-            q.put(None)
+
+        return full_response
+
+    mlflow.set_experiment("summarization")
+
+    @mlflow.trace
+    def worker_without_shields(messages: list[dict], session_id: str):
+        """Use direct inference API when shields are disabled."""
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": session_id},
+        )
+        trace_id = mlflow.get_active_trace_id()
+        if trace_id:
+            trace_id_holder.append(trace_id)
+        print(f"sending chat request to model {model} without shields (Inference API)")
+        full_response = ""
+        try:
+            response = get_openai_client("summarization").chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+            for chunk in response:
+                if hasattr(chunk, 'choices') and chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        full_response += delta.content
+                        q.put(f"data: {json.dumps({'delta': delta.content})}\n\n")
+        except Exception as e:
+            q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
+        return full_response
+
+    def run_without_shields():
+        worker_without_shields(full_messages, session_id)
+        if trace_id_holder:
+            q.put(f"data: {json.dumps({'type': 'trace_id', 'trace_id': trace_id_holder[0]})}\n\n")
+        q.put(None)
+
+    def run_with_shields():
+        worker_with_shields(shields_full_messages, session_id)
+        if trace_id_holder:
+            q.put(f"data: {json.dumps({'type': 'trace_id', 'trace_id': trace_id_holder[0]})}\n\n")
+        q.put(None)
 
     # Choose worker based on shields feature flag
     if FEATURE_FLAGS.get("shields", False):
-        threading.Thread(target=worker_with_shields).start()
+        threading.Thread(target=run_with_shields).start()
     else:
-        threading.Thread(target=worker_without_shields).start()
+        full_messages = [{"role": "system", "content": sys_prompt}] + messages
+        threading.Thread(target=run_without_shields).start()
 
     async def streamer():
         while True:
@@ -693,57 +662,55 @@ async def summarize_chat(request: ChatRequest):
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
 @app.post("/socratic-tutor")
-async def socratic_tutor(request: PromptRequest):
+async def socratic_tutor(request: PromptRequest, raw_request: Request):
     # Check if socratic tutor feature is enabled
     if not FEATURE_FLAGS.get("socratic-tutor", False):
         raise HTTPException(status_code=404, detail="Socratic tutor feature is not enabled")
 
-    sys_prompt = config["socratic-tutor"].get("prompt", "Help the student discover the answer through questioning:")
+    sys_prompt = get_mlflow_prompt("socratic-tutor")
     temperature = config["socratic-tutor"].get("temperature", 0.9)
     max_tokens = config["socratic-tutor"].get("max_tokens", 1500)
     model = config["socratic-tutor"]["model"]
+    session_id = raw_request.headers.get("x-session-id")
 
     q = queue.Queue()
 
-    def worker():
-        print(f"sending request to model {model} for socratic tutoring")
-        print(f"sys_prompt: {sys_prompt}")
-        print(f"user_prompt: {request.prompt}")
+    mlflow.set_experiment("socratic-tutor")
+
+    @mlflow.trace
+    def worker(messages: list[dict], session_id: str):
+        mlflow.update_current_trace(
+            metadata={"mlflow.trace.session": session_id},
+        )
+        full_response = ""
         try:
-            response = llama_client.chat.completions.create(
+            response = get_openai_client("socratic-tutor").chat.completions.create(
                 model=model,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": request.prompt},
-                ],
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
             )
 
-            print(f"[Socratic Tutor] Starting to iterate over response...")
             for r in response:
-                print(f"[Socratic Tutor] Got response chunk: {r}")
                 if hasattr(r, 'choices') and r.choices:
                     delta = r.choices[0].delta
-                    print(f"[Socratic Tutor] Delta: {delta}")
                     if delta.content:
-                        print(f"[Socratic Tutor] Delta content: {delta.content}")
+                        full_response += delta.content
                         chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
                         q.put(chunk)
-                    else:
-                        print(f"[Socratic Tutor] Delta has no content")
-                else:
-                    print(f"[Socratic Tutor] Response has no choices")
 
         except Exception as e:
-            print(f"[Socratic Tutor] Error: {str(e)}")
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:
-            print(f"[Socratic Tutor] Worker done, sending None to queue")
             q.put(None)
+        return full_response
 
-    threading.Thread(target=worker).start()
+    socratic_messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": request.prompt},
+    ]
+    threading.Thread(target=worker, args=(socratic_messages, session_id)).start()
 
     async def streamer():
         while True:
@@ -755,70 +722,93 @@ async def socratic_tutor(request: PromptRequest):
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
 @app.post("/information-search")
-async def information_search(request: PromptRequest):
+async def information_search(request: PromptRequest, raw_request: Request):
     # Check if information search feature is enabled
     if not FEATURE_FLAGS.get("information-search", False):
         raise HTTPException(status_code=404, detail="Information search feature is not enabled")
 
-    # Dummy information search implementation
-    sys_prompt = config["information-search"]["prompt"]
+    sys_prompt = get_mlflow_prompt("information-search")
     temperature = config["information-search"].get("temperature", 0.7)
     max_tokens = config["information-search"].get("max_tokens", 4096)
     vector_db_id = config["information-search"].get("vector_db_id", "latest")
+    session_id = raw_request.headers.get("x-session-id")
 
     q = queue.Queue()
 
-    print(f"Searching in collection {vector_db_id}")
-    print(f"Existing collections: {llama_client.vector_stores.list()}")
-    print(f"query: {request.prompt}")
+    mlflow.set_experiment("information-search")
 
-    search_results = llama_client.vector_stores.search(
-        vector_store_id=vector_db_id,
-        query=request.prompt,
-        max_num_results=5,
-        search_mode="vector"
-    )
-    retrieved_chunks = []
-    for i, result in enumerate(search_results.data):
-        chunk_content = result.content[0].text if hasattr(result, 'content') else str(result)
-        retrieved_chunks.append(chunk_content)
+    @mlflow.trace(span_type="RETRIEVER")
+    def retrieve_chunks(query: str) -> list[str]:
+        results = get_llama_client("information-search").vector_stores.search(
+            vector_store_id=vector_db_id,
+            query=query,
+            max_num_results=5,
+            search_mode="vector"
+        )
+        return [
+            result.content[0].text if hasattr(result, 'content') else str(result)
+            for result in results.data
+        ]
 
-    prompt_context = "\n\n".join(retrieved_chunks)
+    def worker(query: str, session_id: str):
+        with mlflow.start_span(name=query, span_type="CHAIN") as span:
+            trace_id = getattr(span, 'request_id', None) or mlflow.get_active_trace_id()
+            print(f"[information-search] trace_id={trace_id}")
+            span.set_inputs(query)
 
-    enhaned_prompt = f"""Please answer the given query using the document intelligence context below.
+            print(f"Searching in collection {vector_db_id}")
+            print(f"Existing collections: {get_llama_client('information-search').vector_stores.list()}")
+            print(f"query: {query}")
+
+            chunks = retrieve_chunks(query)
+            span.set_attributes({
+                "mlflow.trace.session": session_id,
+                "vector_store_id": vector_db_id,
+                "retrieved_chunks": str(chunks),
+                "num_chunks_retrieved": str(len(chunks)),
+            })
+            prompt_context = "\n\n".join(chunks)
+
+            enhanced_prompt = f"""Please answer the given query using the document intelligence context below.
 
     CONTEXT (Processed with Docling Document Intelligence):
     {prompt_context}
 
     QUERY:
-    {request.prompt}
+    {query}
 
     Note: The context includes intelligently processed content with preserved tables, formulas, figures, and document structure."""
 
-    def worker():
-        print(f"sending requestion to model {config['summarize']['model']}")
-        try:
-            response = llama_client.chat.completions.create(
-                model=config["summarize"]["model"],
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": enhaned_prompt},
-                ],
-                max_tokens=max_tokens, 
-                temperature=temperature,
-                stream=True,
-            )
-            for r in response:
-                if hasattr(r, 'choices') and r.choices:
-                    delta = r.choices[0].delta
-                    chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
-                    q.put(chunk)
-        except Exception as e:
-            q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
-        finally:
-            q.put(None)
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": enhanced_prompt},
+            ]
 
-    threading.Thread(target=worker).start()
+            full_response = ""
+            try:
+                response = get_openai_client("information-search").chat.completions.create(
+                    model=config["information-search"]["model"],
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stream=True,
+                )
+                for r in response:
+                    if hasattr(r, 'choices') and r.choices:
+                        delta = r.choices[0].delta
+                        if delta.content:
+                            full_response += delta.content
+                            chunk = f"data: {json.dumps({'delta': delta.content})}\n\n"
+                            q.put(chunk)
+            except Exception as e:
+                q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
+            finally:
+                if trace_id:
+                    q.put(f"data: {json.dumps({'type': 'trace_id', 'trace_id': trace_id})}\n\n")
+                q.put(None)
+            span.set_outputs({"response": full_response})
+
+    threading.Thread(target=worker, args=(request.prompt, session_id)).start()
 
     async def streamer():
         while True:
@@ -830,95 +820,84 @@ async def information_search(request: PromptRequest):
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
 @app.post("/student-assistant")
-async def student_assistant_chat(request: PromptRequest):
+async def student_assistant_chat(request: PromptRequest, raw_request: Request):
     if not FEATURE_FLAGS.get("student-assistant", False):
         raise HTTPException(status_code=404, detail="Student assistant feature is not enabled")
 
     if not agent:
         raise HTTPException(status_code=500, detail="Student assistant not initialized")
 
+    session_id = raw_request.headers.get("x-session-id")
     q = queue.Queue()
+
+    mlflow.set_experiment("student-assistant")
 
     def worker():
         try:
-            from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-            thread_id = str(int(random.random() * 1000000))
-            config_params = {"configurable": {"thread_id": thread_id}}
-            inputs = {"messages": [HumanMessage(content=request.prompt)]}
+            with mlflow.start_span(name=request.prompt, span_type="AGENT") as span:
+                trace_id = getattr(span, 'request_id', None) or mlflow.get_active_trace_id()
+                span.set_inputs(request.prompt)
 
-            seen_messages = 0
-            seen_tool_calls = set()  # Track which tool calls we've already sent
+                thread_id = session_id or str(int(random.random() * 1000000))
+                config_params = {"configurable": {"thread_id": thread_id}}
+                inputs = {"messages": [{"role": "user", "content": request.prompt}]}
 
-            for state in agent.stream(inputs, config_params, stream_mode="values"):
-                messages = state.get("messages", [])
-                new_messages = messages[seen_messages:]
-                seen_messages = len(messages)
+                mlflow.update_current_trace(
+                    metadata={"mlflow.trace.session": thread_id},
+                )
 
-                for msg in new_messages:
+                result = agent.invoke(inputs, config_params)
+                messages = result.get("messages", [])
+
+                # Send intermediate steps (tool calls and results) to frontend
+                for msg in messages:
                     msg_type = getattr(msg, "type", None)
 
-                    if msg_type == "ai":
-                        # Check for tool calls
-                        if getattr(msg, "tool_calls", None):
-                            for tc in msg.tool_calls:
-                                # Create unique identifier for this tool call
-                                tool_call_id = f"{tc.get('name')}:{json.dumps(tc.get('args'), sort_keys=True)}"
-                                if tool_call_id not in seen_tool_calls:
-                                    seen_tool_calls.add(tool_call_id)
-                                    tool_call_data = {
-                                        "type": "tool_call",
-                                        "name": tc.get("name"),
-                                        "args": tc.get("args")
-                                    }
-                                    chunk = f"data: {json.dumps(tool_call_data)}\n\n"
-                                    q.put(chunk)
-                        else:
-                            # Check for MCP tool outputs
-                            tool_outputs = msg.additional_kwargs.get("tool_outputs", [])
-                            for t in tool_outputs:
-                                if t.get("type") == "mcp_call":
-                                    mcp_data = {
-                                        "type": "mcp_call",
-                                        "name": t.get("name"),
-                                        "server_label": t.get("server_label"),
-                                        "arguments": t.get("arguments"),
-                                        "output": t.get("output", ""),
-                                        "error": t.get("error", "")
-                                    }
-                                    chunk = f"data: {json.dumps(mcp_data)}\n\n"
-                                    q.put(chunk)
+                    if msg_type == "ai" and getattr(msg, "tool_calls", None):
+                        for tc in msg.tool_calls:
+                            tool_call_data = {
+                                "type": "tool_call",
+                                "name": tc.get("name"),
+                                "args": tc.get("args")
+                            }
+                            chunk = f"data: {json.dumps(tool_call_data)}\n\n"
+                            q.put(chunk)
 
                     elif msg_type == "tool":
-                        # Tool result
                         tool_result_data = {
                             "type": "tool_result",
                             "name": msg.name,
-                            "content": str(msg.content)  # Show more content
+                            "content": str(msg.content)
                         }
                         chunk = f"data: {json.dumps(tool_result_data)}\n\n"
                         q.put(chunk)
 
-            # After streaming all intermediate steps, send the final answer
-            if messages:
-                for msg in reversed(messages):
-                    if getattr(msg, "type", None) == "ai":
-                        content = msg.content
-                        if isinstance(content, list):
-                            text_parts = []
-                            for part in content:
-                                if isinstance(part, dict) and part.get("type") == "text":
-                                    text_parts.append(part.get("text", ""))
-                            content = "".join(text_parts)
+                # Extract and send final answer
+                final_answer = ""
+                if messages:
+                    for msg in reversed(messages):
+                        if getattr(msg, "type", None) == "ai" and not getattr(msg, "tool_calls", None):
+                            content = msg.content
+                            if isinstance(content, list):
+                                text_parts = []
+                                for part in content:
+                                    if isinstance(part, dict) and part.get("type") == "text":
+                                        text_parts.append(part.get("text", ""))
+                                content = "".join(text_parts)
 
-                        if content:
-                            # Send final answer marker
-                            chunk = f"data: {json.dumps({'type': 'final_answer'})}\n\n"
-                            q.put(chunk)
-                            # Stream the final answer character by character
-                            for char in content:
-                                chunk = f"data: {json.dumps({'delta': char})}\n\n"
+                            if content:
+                                final_answer = content
+                                chunk = f"data: {json.dumps({'type': 'final_answer'})}\n\n"
                                 q.put(chunk)
-                        break
+                                for char in content:
+                                    chunk = f"data: {json.dumps({'delta': char})}\n\n"
+                                    q.put(chunk)
+                            break
+
+                span.set_outputs({"response": final_answer})
+
+                if trace_id:
+                    q.put(f"data: {json.dumps({'type': 'trace_id', 'trace_id': trace_id})}\n\n")
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
         finally:

@@ -4,7 +4,7 @@ A Helm chart for deploying the Canopy FastAPI Backend application on Kubernetes/
 
 ## Overview
 
-This chart deploys the Canopy Backend application, which is a FastAPI-based service that provides LLM integration capabilities with configurable feature flags for RAG and summarization.
+This chart deploys the Canopy Backend application, which is a FastAPI-based service that provides LLM integration capabilities with configurable feature flags for summarization, information search, student assistant, Socratic tutoring, and more.
 
 ## Prerequisites
 
@@ -34,27 +34,96 @@ helm upgrade canopy-backend ./chart
 
 ## Configuration
 
-The following table lists the configurable parameters of the Canopy Backend chart and their default values.
+Each feature declares its own `endpoint` — the URL of the model server (e.g. vLLM) or LLaMA Stack instance it connects to. This allows different features to target different backends independently.
+
+### Global Parameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `LLAMA_STACK_URL` | Base URL for the LLaMA Stack service | `http://llama-stack` |
-| `summarize.enabled` | Enable summarization functionality | `false` |
-| `summarize.model` | Model to use for summarization | `llama32` |
-| `summarize.prompt` | Prompt template for summarization | `Give me a good summary of the following text.` |
-| `RAG.enabled` | Enable RAG functionality | `false` |
-| `RAG.model` | Model to use for RAG | `llama32` |
-| `RAG.prompt` | Prompt template for RAG | `You are a helpful assistant that answers questions based on the provided context. Use only the information from the context to answer.` |
+| `MLFLOW_TRACKING_URI` | MLflow tracking server URI | `https://mlflow.redhat-ods-applications.svc.cluster.local:8443` |
+
+### Summarize
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `summarization.enabled` | Enable summarization functionality | `true` |
+| `summarization.endpoint` | Model endpoint URL | `http://llama-32-predictor:80/v1` |
+| `summarization.model` | Model identifier | `llama32` |
+| `summarization.temperature` | Temperature for generation | `0.9` |
+| `summarization.max_tokens` | Max tokens for generation | `4096` |
+| `summarization.mlflow_prompt` | MLflow prompt registry name | `summarization` |
+| `summarization.mlflow_prompt_version` | MLflow prompt version | `latest` |
+| `summarization.prompt_b` | Alternative prompt for A/B testing | - |
+
+### Information Search
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `information-search.enabled` | Enable information search | `false` |
+| `information-search.endpoint` | LLaMA Stack endpoint URL | `http://llama-stack-service:8321/v1` |
+| `information-search.model` | Model identifier | `llama32` |
+| `information-search.temperature` | Temperature for generation | `0.7` |
+| `information-search.max_tokens` | Max tokens for generation | `4096` |
+| `information-search.vector_db_id` | Vector database identifier | `latest` |
+| `information-search.mlflow_prompt` | MLflow prompt registry name | `information-search` |
+
+### Shields
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `shields.enabled` | Enable input/output moderation | `false` |
+| `shields.endpoint` | LLaMA Stack endpoint URL | `http://llama-stack-service:8321` |
+| `shields.input_shields` | Shield names for input moderation | `[]` |
+| `shields.output_shields` | Shield names for output moderation | `[]` |
+| `shields.check_interval` | Interval for shield checks | `50` |
+
+### Student Assistant
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `student-assistant.enabled` | Enable student assistant | `false` |
+| `student-assistant.endpoint` | LLaMA Stack endpoint URL | `http://llama-stack-service:8321/v1` |
+| `student-assistant.model` | Model identifier | `llama32` |
+| `student-assistant.temperature` | Temperature for generation | `0.1` |
+| `student-assistant.vector_db_id` | Vector database identifier | `latest` |
+| `student-assistant.mcp_calendar_url` | MCP calendar server URL | `http://canopy-mcp-calendar-mcp-server:8080/sse` |
+| `student-assistant.mlflow_prompt` | MLflow prompt registry name | `student-assistant` |
+
+### Socratic Tutor
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `socratic-tutor.enabled` | Enable Socratic tutor | `false` |
+| `socratic-tutor.endpoint` | Model endpoint URL | `http://llama-32-predictor:80/v1` |
+| `socratic-tutor.model` | Model identifier | `llama32` |
+| `socratic-tutor.temperature` | Temperature for generation | `0.9` |
+| `socratic-tutor.max_tokens` | Max tokens for generation | `1500` |
+| `socratic-tutor.mlflow_prompt` | MLflow prompt registry name | `socratic-tutor` |
+
+### Feedback
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `feedback.enabled` | Enable feedback collection | `true` |
+
+### A/B Testing
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `ab_testing.enabled` | Enable A/B testing | `false` |
 
 ## Values Structure
 
 The chart uses a structured values file that gets mounted as a ConfigMap. The entire values structure is available to the application as a configuration file at `/canopy/canopy-config.yaml`.
 
+A JSON Schema (`values.schema.json`) is provided for validation.
+
 ### Environment Variables
 
-The application uses the following environment variables:
+The deployment sets the following environment variables:
 
-- `LLAMA_BASE_URL`: Base URL for the LLaMA Stack service (sourced from `LLAMA_STACK_URL`)
+- `MLFLOW_TRACKING_URI`: MLflow tracking server URI
+- `MLFLOW_TRACKING_INSECURE_TLS`: Set to `true` for in-cluster MLflow
 
 ## Resources Created
 
@@ -62,40 +131,56 @@ This chart creates the following Kubernetes resources:
 
 - **Deployment**: Main application deployment with single replica
 - **Service**: ClusterIP service exposing port 8000
-- **Route**: OpenShift route for external access
 - **ConfigMap**: Contains the entire values structure as `canopy-config.yaml`
+- **ServiceAccount**: Pod identity for RBAC
+- **RoleBinding**: Cross-namespace access for prompt registry
 
 ## Examples
 
-### Basic Installation
-
-```bash
-helm install canopy-backend ./chart
-```
-
-### Custom Configuration
+### Basic Installation (summarization only)
 
 ```yaml
 # custom-values.yaml
-LLAMA_STACK_URL: "http://my-llama-service:8000"
+MLFLOW_TRACKING_URI: "https://mlflow.apps.example.com"
 
-summarize:
+summarization:
   enabled: true
-  model: "llama3.2"
-  prompt: |
-    Provide a comprehensive summary of the following text,
-    highlighting key points and main themes.
+  endpoint: "http://llama-32-predictor:80/v1"
+  model: llama32
+  mlflow_prompt: summarization
 
-RAG:
+feedback:
   enabled: true
-  model: "llama3.2"
-  prompt: |
-    Answer the following question based on the provided context.
-    If the context doesn't contain relevant information, say so.
 ```
 
-```bash
-helm install canopy-backend ./chart -f custom-values.yaml
+### Adding Llama Stack features
+
+```yaml
+# custom-values.yaml
+MLFLOW_TRACKING_URI: "https://mlflow.apps.example.com"
+
+summarization:
+  enabled: true
+  endpoint: "http://llama-32-predictor:80/v1"
+  model: llama32
+  mlflow_prompt: summarization
+
+information-search:
+  enabled: true
+  endpoint: "http://llama-stack-service:8321/v1"
+  model: llama32
+  vector_db_id: latest
+  mlflow_prompt: information-search
+
+student-assistant:
+  enabled: true
+  endpoint: "http://llama-stack-service:8321/v1"
+  model: llama32
+  vector_db_id: latest
+  mlflow_prompt: student-assistant
+
+feedback:
+  enabled: true
 ```
 
 ## Uninstallation
@@ -103,12 +188,6 @@ helm install canopy-backend ./chart -f custom-values.yaml
 ```bash
 helm uninstall canopy-backend
 ```
-
-## Chart Information
-
-- **Chart Version**: 0.1.0
-- **App Version**: 1.0.0
-- **Chart Type**: application
 
 ## Support
 

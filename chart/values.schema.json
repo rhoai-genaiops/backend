@@ -3,18 +3,38 @@
   "type": "object",
   "title": "Canopy Backend Helm Chart Values Schema",
   "description": "Schema for validating values.yaml configuration for the Canopy Backend Helm chart",
-  "properties": {
-    "LLAMA_STACK_URL": {
+  "definitions": {
+    "endpoint": {
       "type": "string",
-      "description": "Base URL for the LLaMA Stack service",
+      "description": "Base URL for the model or LLaMA Stack endpoint this feature connects to",
       "pattern": "^https?://[^\\s]+$",
       "examples": [
-        "http://llama-stack",
-        "http://llama-stack:8000",
-        "https://my-llama-service.example.com"
+        "http://llama-32-predictor:80/v1",
+        "http://llama-stack-service:8321/v1"
+      ]
+    }
+  },
+  "properties": {
+    "MLFLOW_TRACKING_URI": {
+      "type": "string",
+      "description": "MLflow tracking server URI",
+      "examples": [
+        "https://mlflow.apps.example.com/mlflow"
       ]
     },
-    "summarize": {
+    "chart_path": {
+      "type": "string",
+      "description": "Path to the Helm chart in the repository"
+    },
+    "repo_url": {
+      "type": "string",
+      "description": "URL of the source repository"
+    },
+    "target_revision": {
+      "type": "string",
+      "description": "Git revision (branch, tag, or commit) used by the ApplicationSet"
+    },
+    "summarization": {
       "type": "object",
       "description": "Configuration for summarization functionality",
       "properties": {
@@ -23,32 +43,34 @@
           "description": "Enable or disable summarization functionality",
           "default": false
         },
+        "endpoint": { "$ref": "#/definitions/endpoint" },
         "model": {
           "type": "string",
           "description": "Model identifier to use for summarization",
           "minLength": 1,
           "examples": [
             "llama32",
-            "llama3.2"          
+            "llama3.2"
           ]
-        },
-        "prompt": {
-          "type": "string",
-          "description": "Prompt template for summarization requests",
-          "minLength": 1
-        },
-        "max_tokens": {
-          "type": "number",
-          "description": "Max tokens for the model"
         },
         "temperature": {
           "type": "number",
           "description": "Temperature for the model"
         },
-        "prompt_b": {
+        "max_tokens": {
+          "type": "number",
+          "description": "Max tokens for the model"
+        },
+        "mlflow_prompt": {
           "type": "string",
-          "description": "Alternative prompt for A/B testing",
-          "minLength": 1
+          "description": "MLflow prompt registry name for this feature",
+          "examples": ["summarization"]
+        },
+        "mlflow_prompt_version": {
+          "type": "string",
+          "description": "MLflow prompt version for this feature (alias or number)",
+          "default": "latest",
+          "examples": ["latest", "1", "2"]
         }
       },
       "required": ["enabled"],
@@ -56,7 +78,7 @@
         "properties": { "enabled": { "const": true } }
       },
       "then": {
-        "required": ["model", "prompt"]
+        "required": ["endpoint", "model", "mlflow_prompt"]
       },
       "additionalProperties": false
     },
@@ -69,20 +91,34 @@
           "description": "Enable or disable information search functionality",
           "default": false
         },
+        "endpoint": { "$ref": "#/definitions/endpoint" },
         "model": {
           "type": "string",
           "description": "Model identifier to use for information search",
           "minLength": 1,
           "examples": [
             "llama32",
-            "llama3.2",
-            "gpt-4"
+            "llama3.2"
           ]
         },
-        "prompt": {
+        "temperature": {
+          "type": "number",
+          "description": "Temperature for the model"
+        },
+        "max_tokens": {
+          "type": "number",
+          "description": "Max tokens for the model"
+        },
+        "mlflow_prompt": {
           "type": "string",
-          "description": "System prompt for information search requests",
-          "minLength": 1
+          "description": "MLflow prompt registry name for this feature",
+          "examples": ["information-search"]
+        },
+        "mlflow_prompt_version": {
+          "type": "string",
+          "description": "MLflow prompt version for this feature (alias or number)",
+          "default": "latest",
+          "examples": ["latest", "1", "2"]
         },
         "vector_db_id": {
           "type": "string",
@@ -94,28 +130,9 @@
             "production"
           ]
         },
-        "max_tokens": {
-          "type": "number",
-          "description": "Max tokens for the model"
-        },
-        "temperature": {
-          "type": "number",
-          "description": "Temperature for the model"
-        },
-        "chart_path": {
-          "type": "string",
-          "description": "Target namespace for deployment (format: userX-environment)",
-          "examples": []
-        },
         "repo_url": {
           "type": "string",
-          "description": "Repository URL for the Helm chart",
-          "examples": []
-        },
-        "target_revision": {
-          "type": "string",
-          "description": "Target Revision for the Helm chart",
-          "examples": []
+          "description": "Repository URL for the Helm chart"
         }
       },
       "required": ["enabled"],
@@ -123,110 +140,140 @@
         "properties": { "enabled": { "const": true } }
       },
       "then": {
-        "required": ["model", "prompt"]
-      },
-      "additionalProperties": false
-    },
-    "student-assistant": {
-      "type": "object",
-      "description": "Configuration for information search functionality",
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Enable or disable information search functionality",
-          "default": false
-        },
-        "model": {
-          "type": "string",
-          "description": "Model identifier to use for information search",
-          "minLength": 1,
-          "examples": [
-            "llama32",
-            "llama3.2",
-            "gpt-4"
-          ]
-        },
-        "prompt": {
-          "type": "string",
-          "description": "System prompt for information search requests",
-          "minLength": 1
-        },
-        "vector_db_id": {
-          "type": "string",
-          "description": "Vector database identifier to use for information search",
-          "minLength": 1,
-          "examples": [
-            "latest",
-            "v1.0",
-            "production"
-          ]
-        },
-        "max_tokens": {
-          "type": "number",
-          "description": "Max tokens for the model"
-        },
-        "mcp_calendar_url": {
-          "type": "string",
-          "description": "Url for the MCP calendar"
-        },
-        "temperature": {
-          "type": "number",
-          "description": "Temperature for the model"
-        },
-        "chart_path": {
-          "type": "string",
-          "description": "Target namespace for deployment (format: userX-environment)",
-          "examples": []
-        },
-        "repo_url": {
-          "type": "string",
-          "description": "Repository URL for the Helm chart",
-          "examples": []
-        },
-        "target_revision": {
-          "type": "string",
-          "description": "Target Revision for the Helm chart",
-          "examples": []
-        }
-      },
-      "required": ["enabled"],
-      "if": {
-        "properties": { "enabled": { "const": true } }
-      },
-      "then": {
-        "required": ["model"]
+        "required": ["endpoint", "model", "mlflow_prompt"]
       },
       "additionalProperties": false
     },
     "shields": {
       "type": "object",
-      "description": "Configuration for input/output moderation shields",
+      "description": "NeMo Guardrails configuration — when enabled, all requests go through the NeMo Guardrails OpenAI-compatible endpoint",
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Enable or disable shields functionality",
+          "description": "Enable or disable NeMo Guardrails",
           "default": false
         },
-        "input_shields": {
-          "type": "array",
-          "description": "Shield names for input moderation",
-          "items": {
-            "type": "string"
-          },
+        "endpoint": { "$ref": "#/definitions/endpoint" },
+        "config": {
+          "type": "string",
+          "description": "NeMo Guardrails configuration name (maps to the config folder name in the NeMo server)",
+          "default": "canopy-guardrails",
+          "examples": ["canopy-guardrails"]
+        },
+        "model": {
+          "type": "string",
+          "description": "Model name to use when routing requests through NeMo Guardrails"
+        }
+      },
+      "additionalProperties": false
+    },
+    "student-assistant": {
+      "type": "object",
+      "description": "Configuration for student assistant functionality",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable or disable student assistant functionality",
+          "default": false
+        },
+        "endpoint": { "$ref": "#/definitions/endpoint" },
+        "model": {
+          "type": "string",
+          "description": "Model identifier to use for student assistant",
+          "minLength": 1,
           "examples": [
-            ["hap", "language_detection", "prompt_injection"]
+            "llama32",
+            "llama3.2"
           ]
         },
-        "output_shields": {
-          "type": "array",
-          "description": "Shield names for output moderation",
-          "items": {
-            "type": "string"
-          },
+        "temperature": {
+          "type": "number",
+          "description": "Temperature for the model"
+        },
+        "max_tokens": {
+          "type": "number",
+          "description": "Max tokens for the model"
+        },
+        "mlflow_prompt": {
+          "type": "string",
+          "description": "MLflow prompt registry name for this feature",
+          "examples": ["student-assistant"]
+        },
+        "mlflow_prompt_version": {
+          "type": "string",
+          "description": "MLflow prompt version for this feature (alias or number)",
+          "default": "latest",
+          "examples": ["latest", "1", "2"]
+        },
+        "vector_db_id": {
+          "type": "string",
+          "description": "Vector database identifier to use for knowledge base search",
+          "minLength": 1,
           "examples": [
-            []
+            "latest",
+            "v1.0",
+            "production"
           ]
+        },
+        "mcp_calendar_url": {
+          "type": "string",
+          "description": "URL for the MCP calendar server"
         }
+      },
+      "required": ["enabled"],
+      "if": {
+        "properties": { "enabled": { "const": true } }
+      },
+      "then": {
+        "required": ["endpoint", "model", "mlflow_prompt"]
+      },
+      "additionalProperties": false
+    },
+    "socratic-tutor": {
+      "type": "object",
+      "description": "Configuration for Socratic tutor functionality",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable or disable Socratic tutor functionality",
+          "default": false
+        },
+        "endpoint": { "$ref": "#/definitions/endpoint" },
+        "model": {
+          "type": "string",
+          "description": "Model identifier to use for Socratic tutoring (fine-tuned model)",
+          "minLength": 1,
+          "examples": [
+            "socratic-tutor-lora",
+            "llama32-socratic"
+          ]
+        },
+        "temperature": {
+          "type": "number",
+          "description": "Temperature for the model"
+        },
+        "max_tokens": {
+          "type": "number",
+          "description": "Max tokens for the model"
+        },
+        "mlflow_prompt": {
+          "type": "string",
+          "description": "MLflow prompt registry name for this feature",
+          "examples": ["socratic-tutor"]
+        },
+        "mlflow_prompt_version": {
+          "type": "string",
+          "description": "MLflow prompt version for this feature (alias or number)",
+          "default": "latest",
+          "examples": ["latest", "1", "2"]
+        }
+      },
+      "required": ["enabled"],
+      "if": {
+        "properties": { "enabled": { "const": true } }
+      },
+      "then": {
+        "required": ["endpoint", "model", "mlflow_prompt"]
       },
       "additionalProperties": false
     },
@@ -250,52 +297,16 @@
           "type": "boolean",
           "description": "Enable or disable A/B testing",
           "default": false
-        }
-      },
-      "additionalProperties": false
-    },
-    "socratic-tutor": {
-      "type": "object",
-      "description": "Configuration for Socratic tutor functionality",
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Enable or disable Socratic tutor functionality",
-          "default": false
         },
-        "model": {
+        "mlflow_prompt_b_version": {
           "type": "string",
-          "description": "Model identifier to use for Socratic tutoring (fine-tuned model)",
-          "minLength": 1,
-          "examples": [
-            "socratic-tutor-lora",
-            "llama32-socratic"
-          ]
-        },
-        "prompt": {
-          "type": "string",
-          "description": "Prompt template for Socratic tutor requests",
-          "minLength": 1
-        },
-        "max_tokens": {
-          "type": "number",
-          "description": "Max tokens for the model"
-        },
-        "temperature": {
-          "type": "number",
-          "description": "Temperature for the model"
+          "description": "MLflow prompt alias or version to use as the challenger (B) in A/B testing",
+          "examples": ["latest", "challenger", "2"]
         }
-      },
-      "required": ["enabled"],
-      "if": {
-        "properties": { "enabled": { "const": true } }
-      },
-      "then": {
-        "required": ["model", "prompt"]
       },
       "additionalProperties": false
     }
   },
-  "required": ["LLAMA_STACK_URL"],
+  "required": ["MLFLOW_TRACKING_URI"],
   "additionalProperties": false
 }

@@ -19,32 +19,18 @@ spec:
         monitoring.opendatahub.io/scrape: 'true'
       annotations:
         configmap: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        # Use local instrumentation CR for traces (metrics stay with RHOAI)
-        instrumentation.opentelemetry.io/inject-python: "true"
     spec:
+      serviceAccountName: canopy-be
       containers:
         - name: canopy-backend
-          image: quay.io/rhoai-genaiops/canopy-be:0.16
+          image: quay.io/rhoai-genaiops/canopy-be:0.30
           ports:
             - containerPort: 8000
           env:
-            - name: LLAMA_BASE_URL
-              value: "{{ .Values.LLAMA_STACK_URL }}"
-            - name: OTEL_TRACES_SAMPLER_ARG
-              value: "1.0"
-            - name: OTEL_LOGS_EXPORTER
-              value: "none"
-            # TRACES go to user's toolings namespace collector
-            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
-              value: "http://trace-collector-collector.{{ .Values.toolingsNamespace | default (printf "%s-toolings" (trimSuffix "-canopy" .Release.Namespace | trimSuffix "-test" | trimSuffix "-prod")) }}.svc.cluster.local:4318/v1/traces"
-            # METRICS stay with RHOAI (unchanged)
-            - name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
-              value: "http://data-science-collector-collector-headless.redhat-ods-monitoring.svc.cluster.local:4318/v1/metrics"
-            # General endpoint for traces
-            - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: "http://trace-collector-collector.{{ .Values.toolingsNamespace | default (printf "%s-toolings" (trimSuffix "-canopy" .Release.Namespace | trimSuffix "-test" | trimSuffix "-prod")) }}.svc.cluster.local:4318"
-            - name: TELEMETRY_SINKS
-              value: "otel_trace"
+            - name: MLFLOW_TRACKING_URI
+              value: "{{ .Values.MLFLOW_TRACKING_URI }}"
+            - name: MLFLOW_TRACKING_INSECURE_TLS
+              value: "true"
           volumeMounts:
             - mountPath: /canopy
               name: canopy-config

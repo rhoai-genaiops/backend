@@ -501,7 +501,7 @@ def batch_docling_processing_component(
 
 @component(
     base_image='python:3.12',
-    packages_to_install=['llama_stack_client==0.3.0', 'fire', 'requests']
+    packages_to_install=['llama_stack_client==0.7.2', 'fire', 'requests']
 )
 def vector_database_component(
     setup_config: Dict[str, Any]
@@ -632,7 +632,7 @@ def vector_database_component(
 
 @component(
     base_image='python:3.12',
-    packages_to_install=['llama_stack_client==0.3.0', 'fire', 'requests']
+    packages_to_install=['llama_stack_client==0.7.2', 'fire', 'requests']
 )
 def batch_document_ingestion_component(
     setup_config: Dict[str, Any],
@@ -659,7 +659,7 @@ def batch_document_ingestion_component(
     Returns:
         NamedTuple containing batch ingestion results
     """
-    from llama_stack_client import LlamaStackClient, RAGDocument
+    from llama_stack_client import LlamaStackClient
     from collections import namedtuple
     import os
 
@@ -704,10 +704,12 @@ def batch_document_ingestion_component(
         provider_data=None
     )
 
-    documents_to_ingest = []
+    from io import BytesIO
+
+    uploaded_file_ids = []
     successful_reads = 0
 
-    # Read and prepare all processed files
+    # Upload all processed files to llama stack files API
     for idx, content_file_path in enumerate(processed_files, 1):
         print(f"\nReading processed file {idx}/{processed_count}: {content_file_path}")
 
@@ -717,41 +719,29 @@ def batch_document_ingestion_component(
 
             print(f"  [OK] Read {len(processed_content)} characters")
 
-            # Use original MinIO key for accurate source tracking
-            # This preserves special characters like spaces, parentheses, en-dashes, etc.
             original_key = original_keys[idx - 1] if idx <= len(original_keys) else f"unknown_{idx}"
-            doc_id = f"doc_{idx}"
-
             print(f"  - Original source: {original_key}")
 
-            # Create RAGDocument with original MinIO path
-            documents_to_ingest.append(
-                RAGDocument(
-                    document_id=doc_id,
-                    content=processed_content,
-                    metadata={
-                        "source": f"minio://{bucket_name}/{original_key}",  # Use original key with special characters
-                        "original_filename": original_key,  # Preserve filename with special characters
-                        "processing_method": "docling",
-                        "document_type": "academic_paper",
-                        "has_tables": True,
-                        "has_formulas": True,
-                        "has_figures": True,
-                        "batch_index": idx
-                    },
-                )
+            file_content = BytesIO(processed_content.encode('utf-8'))
+            file_content.name = f"doc_{idx}.txt"
+
+            uploaded_file = client.files.create(
+                file=file_content,
+                purpose="assistants"
             )
+            uploaded_file_ids.append(uploaded_file.id)
+            print(f"  [OK] Uploaded as file ID: {uploaded_file.id}")
             successful_reads += 1
 
         except FileNotFoundError:
             print(f"  [FAILED] File not found: {content_file_path}")
             continue
         except Exception as e:
-            print(f"  [FAILED] Error reading file: {e}")
+            print(f"  [FAILED] Error uploading file: {e}")
             continue
 
     if successful_reads == 0:
-        error_msg = "No documents could be read for ingestion"
+        error_msg = "No documents could be uploaded for ingestion"
         print(error_msg)
         BatchIngestionOutput = namedtuple("BatchIngestionOutput", ["ingestion_results"])
         return BatchIngestionOutput(ingestion_results={
@@ -762,21 +752,28 @@ def batch_document_ingestion_component(
         })
 
     print("\n" + "=" * 60)
-    print(f"Ingesting {successful_reads} documents into {len(vector_db_ids)} vector database(s)...")
+    print(f"Attaching {successful_reads} files into {len(vector_db_ids)} vector database(s)...")
     print(f"  - Chunk Size: {chunk_size} tokens")
 
-    # Ingest all documents into each vector database
+    # Attach uploaded files to each vector database
     ingestion_errors = []
     successfully_ingested_dbs = []
 
     for vector_db_id in vector_db_ids:
         print(f"\n--- Ingesting into database: {vector_db_id} ---")
         try:
-            client.tool_runtime.rag_tool.insert(
-                documents=documents_to_ingest,
-                vector_db_id=vector_db_id,
-                chunk_size_in_tokens=chunk_size,
-            )
+            for file_id in uploaded_file_ids:
+                client.vector_stores.files.create(
+                    vector_store_id=vector_db_id,
+                    file_id=file_id,
+                    chunking_strategy={
+                        "type": "static",
+                        "static": {
+                            "max_chunk_size_tokens": chunk_size,
+                            "chunk_overlap_tokens": 50
+                        }
+                    }
+                )
             print(f"[OK] Successfully ingested {successful_reads} documents into '{vector_db_id}'")
             successfully_ingested_dbs.append(vector_db_id)
 
@@ -1085,8 +1082,8 @@ if __name__ == '__main__':
     arguments = {
         "minio_secret_name": "documents", 
         "minio_bucket_name": "documents",  
-        "embedding_model": "all-MiniLM-L6-v2",
-        "embedding_dimension": 384,
+        "embedding_model": "sentence-transformers/nomic-ai/nomic-embed-text-v1.5",
+        "embedding_dimension": 768,
         "chunk_size_tokens": 512,
         "vector_provider": "milvus",
         "docling_service": "http://docling-v0-7-0-predictor.ai501.svc.cluster.local:5001",
@@ -1143,7 +1140,7 @@ if __name__ == '__main__':
         print(f"MinIO Bucket: {arguments['minio_bucket_name']} (ALL files will be processed)")
         print(f"Secret Name: {arguments['minio_secret_name']}")
         print(f"Experiment: document-intelligence-rag")
-        print(f"Model: all-MiniLM-L6-v2 (384D)")
+        print(f"Model: sentence-transformers/nomic-ai/nomic-embed-text-v1.5 (768D)")
         print(f"Chunk Size: {arguments['chunk_size_tokens']} tokens")
         print(f"Vector DB: {arguments['vector_provider']}")
         print(f"Vector DB ID: {arguments['vector_db_id']}")

@@ -34,7 +34,7 @@ helm install canopy-backend ./helm-chart/canopy-backend
 
 ## API Endpoints
 
-### POST /summarize
+### POST /summarization
 
 Summarize text using the language model with streaming response.
 
