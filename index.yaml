@@ -3,6 +3,21 @@ entries:
   canopy-backend:
   - apiVersion: v2
     appVersion: 1.0.0
+    created: "2026-05-28T15:31:55.460741744Z"
+    description: A Helm chart for Canopy FastAPI Backend
+    digest: 224805e502a6d50fb8290ebe4642f254594e0d95288afacfb3d37339cb3cbd10
+    icon: https://images-wixmp-ed30a86b8c4ca887773594c2.wixmp.com/i/7987a60d-5266-4eb6-9adf-ea9f92b38af1/dclxmrl-0f31717b-ab84-4f85-b2fc-7364492d0ef9.png
+    maintainers:
+    - name: ckavili
+    - name: rhrolun
+    - name: rcarrata
+    name: canopy-backend
+    type: application
+    urls:
+    - https://github.com/rhoai-genaiops/backend/releases/download/canopy-backend-0.1.4/canopy-backend-0.1.4.tgz
+    version: 0.1.4
+  - apiVersion: v2
+    appVersion: 1.0.0
     created: "2026-03-25T23:14:58.458853722Z"
     description: A Helm chart for Canopy FastAPI Backend
     digest: 4b72c25e6869bde664e8c0e05fc8405773e5b6b72d9eb12b78a6f217492e752d
@@ -331,4 +346,4 @@ entries:
     urls:
     - https://github.com/rhoai-genaiops/backend/releases/download/canopy-backend-0.0.1/canopy-backend-0.0.1.tgz
     version: 0.0.1
-generated: "2026-03-25T23:14:58.459005886Z"
+generated: "2026-05-28T15:31:55.460912834Z"
