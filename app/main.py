@@ -23,6 +23,7 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 import random
+import httpx
 import mlflow
 
 app = FastAPI(title="Canopy Backend API")
@@ -540,56 +541,65 @@ async def summarization_chat(request: ChatRequest, raw_request: Request):
     q = queue.Queue()
 
     shields_full_messages = [{"role": "system", "content": sys_prompt}] + messages
-    current_user_message = messages[-1]["content"] if messages else ""
     trace_id_holder = []
 
     @mlflow.trace
-    def worker_with_shields(messages: list[dict], user_message: str, session_id: str):
+    def worker_with_shields(messages: list[dict], session_id: str):
         trace_id = mlflow.get_active_trace_id()
         if trace_id:
             trace_id_holder.append(trace_id)
         mlflow.update_current_trace(metadata={"mlflow.trace.session": session_id})
-        shield_model = config["shields"]["model"]
 
-        first_content_seen = False
-        is_refusal = False
-        refusal_buffer = ""
+        nemo_endpoint = config["shields"]["endpoint"].rstrip("/")
+        guardrail_config = config["shields"]["config"]
         full_response = ""
 
         try:
-            nemo_client = get_openai_client("shields")
-            stream = nemo_client.chat.completions.create(
-                model=shield_model,
+            check_resp = httpx.post(
+                f"{nemo_endpoint}/guardrail/checks",
+                json={"model": config["shields"]["model"], "messages": messages},
+                timeout=30.0,
+            )
+            check_resp.raise_for_status()
+            result = check_resp.json()
+        except Exception as e:
+            q.put(f"data: {json.dumps({'error': f'Guardrail check failed: {str(e)}'})}\n\n")
+            return full_response
+
+        if result.get("status") == "blocked":
+            activated = result.get("guardrails_data", {}).get("log", {}).get("activated_rails", [])
+            rail_name = activated[0] if activated else ""
+            _RAIL_MESSAGES = {
+                "check language": "🌐 Please use English only. I can only respond to questions in English.",
+                "regex check input": "🚫 I'm sorry, that topic is outside the scope of what I can help with. If you have an academic question or need help with your studies at Redwood Digital University, I'm happy to assist! 🎓",
+                "regex check output": "⚠️ I'm not able to provide information on that topic. Let me know if there's something else I can help you with! 📚",
+                "detect sensitive data on input": "🔒 Sensitive personal information detected. For your privacy, I cannot process messages containing personal data.",
+                "detect sensitive data on output": "🔒 Sensitive personal information detected. For your privacy, I cannot process messages containing personal data.",
+                "hf classifier check input": "🚫 Inappropriate content detected. Please keep your messages respectful and professional.",
+                "hf classifier check output": "😔 I cannot provide that response as it may contain inappropriate content. Please rephrase your question.",
+                "self check input": "🤔 I'm sorry, I'm not able to help with that request. If you have an academic question or need help with your studies at Redwood Digital University, I'm happy to assist! 🎓",
+            }
+            refusal = _RAIL_MESSAGES.get(rail_name, "🤔 I'm sorry, I'm not able to help with that request.")
+            q.put(f"data: {json.dumps({'delta': refusal})}\n\n")
+            return refusal
+
+        try:
+            response = get_openai_client("summarization").chat.completions.create(
+                model=model,
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
             )
-            for chunk in stream:
-                if not (hasattr(chunk, "choices") and chunk.choices):
-                    continue
-                content = chunk.choices[0].delta.content
-                if not content:
-                    continue
-
-                # Peek at the first chunk to detect a refusal emoji prefix.
-                if not first_content_seen:
-                    first_content_seen = True
-                    detector, css_class = _detect_refusal(content)
-                    is_refusal = detector is not None
-
-                if is_refusal:
-                    refusal_buffer += content
-                else:
-                    full_response += content
-                    q.put(f"data: {json.dumps({'delta': content})}\n\n")
-
-            if is_refusal:
-                full_response = refusal_buffer.strip()
-                q.put(f"data: {json.dumps({'delta': full_response})}\n\n")
-
+            for chunk in response:
+                if hasattr(chunk, "choices") and chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        full_response += delta.content
+                        q.put(f"data: {json.dumps({'delta': delta.content})}\n\n")
         except Exception as e:
             q.put(f"data: {json.dumps({'error': str(e)})}\n\n")
+
         return full_response
 
     mlflow.set_experiment("summarization")
@@ -630,7 +640,7 @@ async def summarization_chat(request: ChatRequest, raw_request: Request):
         q.put(None)
 
     def run_with_shields():
-        worker_with_shields(shields_full_messages, current_user_message, session_id)
+        worker_with_shields(shields_full_messages, session_id)
         if trace_id_holder:
             q.put(f"data: {json.dumps({'type': 'trace_id', 'trace_id': trace_id_holder[0]})}\n\n")
         q.put(None)
